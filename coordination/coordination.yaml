@@ -1,0 +1,73 @@
+schema_version: coordination.v1
+
+project:
+  project_id: "gpt---github---codex"
+  repository: "yeuei/gpt---github---codex"
+
+clients:
+  chatgpt:
+    client_id: "chatgpt"
+    role: "planner_coordinator"
+  agent:
+    client_id: "codex-agent"
+    role: "local_executor"
+
+event_protocol:
+  enabled: false
+  required_fields:
+    - event_id
+    - repository
+    - pr_number
+    - action
+    - head_sha
+    - origin
+    - client_id
+  optional_fields:
+    - caused_by_event_id
+    - delivery_id
+    - created_at
+
+routing:
+  agent_origin:
+    notify:
+      - chatgpt
+    suppress:
+      - agent
+  chatgpt_origin:
+    notify:
+      - agent
+    suppress:
+      - chatgpt
+
+origin_values:
+  - agent
+  - chatgpt
+  - human
+  - external
+
+deduplication:
+  primary_key: event_id
+  secondary_key:
+    - repository
+    - pr_number
+    - head_sha
+    - origin
+
+trigger_prompts:
+  chatgpt: >-
+    GitHub 协作事件：PR #{pr_number} 已由 Agent 更新。
+    请读取该 PR 最新 diff、任务.md 与 agent汇报.md，按照 ChatGPT 协作职责处理。
+    本事件只负责唤醒；GitHub 当前文件才是正式任务与状态真源。
+  agent: >-
+    GitHub 协作事件：PR #{pr_number} 已由 ChatGPT 更新。
+    请 fetch/pull 最新远端状态，读取任务.md 与 chatgpt解惑.md，
+    核对本地实际状态后继续执行。本事件只负责唤醒；不要重复已完成任务。
+
+commit_trailers:
+  origin: "Coordination-Origin"
+  client: "Coordination-Client"
+  event_id: "Coordination-Event-Id"
+  caused_by_event_id: "Coordination-Caused-By"
+
+security:
+  store_secrets_in_repository: false
