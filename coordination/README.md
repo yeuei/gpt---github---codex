@@ -20,7 +20,7 @@ coordination/
 
 ## 新 PR
 
-真实 PR 创建后，复制 `TEMPLATE/` 到 `PR-<N>/`，再填写真实任务和状态。禁止预建虚构 PR 目录。
+复制 `TEMPLATE/` 到 `PR-<N>/`。
 
 ## 开放 PR
 

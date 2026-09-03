@@ -71,3 +71,7 @@ commit_trailers:
 
 security:
   store_secrets_in_repository: false
+  pairing_design_note: >-
+    如果未来接入 Coordination Hub，应为 ChatGPT 和 Agent 分配不同设备凭据，
+    通过同一 pair_id 关联，而不是共享同一个 API key。MFA 用于初次设备配对、
+    凭据轮换和敏感权限变更，不应要求每次 WebSocket 重连都重新 MFA。

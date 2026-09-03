@@ -29,13 +29,7 @@
 
 ## Agent 已获得的权限
 
-明确哪些事情 Agent 可以自行决定，不需要继续等待，例如：
-
-- manifest 路径 / schema；
-- deterministic seed；
-- row-id 编码；
-- run 目录；
-- logging / retry / resume 等普通工程实现。
+明确哪些事情 Agent 可以自行决定，不需要继续等待，例如：manifest 路径 / schema、deterministic seed、row-id 编码、run 目录、logging / retry / resume 等普通工程实现。
 
 ## 立即执行
 
@@ -53,13 +47,7 @@
 
 `无`
 
-如果确实需要用户，必须缩成最小决策：
-
-```text
-需要用户决定：A / B
-推荐：A
-原因：...
-```
+如果确实需要用户，必须缩成最小决策：A / B，并给出推荐与原因。
 
 ## Blocker 处理硬规则
 
@@ -70,5 +58,3 @@ A. 直接解决
 B. 授权 Agent 自行决定
 C. 请求用户做最小化决策
 ```
-
-禁止只写“先解决 blocker 再继续”。
