@@ -3,4 +3,4 @@
 trigger/config.local.json
 trigger/state.sqlite3
 trigger/__pycache__/
-
+trigger/approval-requests/

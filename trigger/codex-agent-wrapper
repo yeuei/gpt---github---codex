@@ -3,12 +3,7 @@ set -euo pipefail
 
 # Optional local-agent entrypoint for the ChatGPT → Agent route.
 # The trigger passes the handoff prompt as the remaining argv. Keep Codex's
-# command approval policy visible; do not use a bypass flag here.
+# command approval policy visible; do not use a bypass flag here.  The bridge
+# uses Codex app-server so on-request approvals can reach the local Dashboard.
 repo_dir="$(cd "$(dirname "$0")/.." && pwd)"
-codex_bin="${CODEX_BIN:-$(command -v codex)}"
-exec "$codex_bin" \
-  --ask-for-approval on-request \
-  exec \
-  --cd "$repo_dir" \
-  --sandbox workspace-write \
-  "$@"
+exec python3 "$repo_dir/trigger/codex-agent-app-server.py" "$@"

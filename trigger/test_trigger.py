@@ -1,4 +1,5 @@
 import importlib.util
+import json
 import sys
 import tempfile
 import unittest
@@ -11,8 +12,47 @@ assert SPEC.loader
 sys.modules[SPEC.name] = trigger
 SPEC.loader.exec_module(trigger)
 
+APP_SERVER = Path(__file__).with_name("codex-agent-app-server.py")
+APP_SPEC = importlib.util.spec_from_file_location("codex_agent_app_server", APP_SERVER)
+app_server = importlib.util.module_from_spec(APP_SPEC)
+assert APP_SPEC.loader
+sys.modules[APP_SPEC.name] = app_server
+APP_SPEC.loader.exec_module(app_server)
+
 
 class TriggerTests(unittest.TestCase):
+    def test_app_server_approval_decisions_follow_available_options(self):
+        params = {"availableDecisions": ["accept", "acceptForSession", "decline", "cancel"],
+                  "proposedExecpolicyAmendment": ["touch", "/tmp/probe"]}
+        self.assertEqual(app_server.decision_from_available(params, "accept"), "accept")
+        self.assertEqual(app_server.decision_from_available(params, "session"), "acceptForSession")
+        self.assertEqual(app_server.decision_from_available(params, "acceptForSession"), "acceptForSession")
+        self.assertEqual(app_server.decision_from_available(params, "decline"), "decline")
+
+    def test_app_server_session_falls_back_to_execpolicy_amendment(self):
+        params = {"availableDecisions": ["accept", "decline"],
+                  "proposedExecpolicyAmendment": ["npm", "test"]}
+        self.assertEqual(
+            app_server.decision_from_available(params, "session"),
+            {"acceptWithExecpolicyAmendment": {"execpolicy_amendment": ["npm", "test"]}},
+        )
+
+    def test_dashboard_approval_request_can_be_resolved(self):
+        with tempfile.TemporaryDirectory() as directory:
+            inbox = Path(directory) / "approval-requests"
+            inbox.mkdir()
+            path = inbox / "pid-1.json"
+            path.write_text('{"id":"pid-1","method":"item/commandExecution/requestApproval","params":{"command":"echo test"},"decision":null}', encoding="utf-8")
+            original = trigger.APPROVAL_DIR
+            try:
+                trigger.APPROVAL_DIR = inbox
+                self.assertEqual([item["id"] for item in trigger.pending_approval_requests()], ["pid-1"])
+                self.assertTrue(trigger.resolve_approval_request("pid-1", "accept"))
+                self.assertEqual(trigger.pending_approval_requests(), [])
+                self.assertEqual(json.loads(path.read_text(encoding="utf-8"))["decision"], "accept")
+            finally:
+                trigger.APPROVAL_DIR = original
+
     def test_commit_trailers_are_case_insensitive(self):
         commit = trigger.Commit("a" * 40, "Coordination-Origin: AGENT\nCoordination-Event-Id: evt-1\nCoordination-Caused-By: parent", "update")
         self.assertEqual(commit.origin, "agent")

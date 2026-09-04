@@ -24,9 +24,11 @@ coordination trailers, and writes its audit trail to local SQLite—not Git.
 - `ChatGPT Web → agent` starts only the user-configured local command. An empty
   command causes a visible `needs human` event rather than a surprise process.
   This repository includes an optional `trigger/codex-agent-wrapper` example;
-  review it first, then set `agent.command` to its absolute path if you want
-  the reverse route to launch Codex CLI with `workspace-write` and normal
-  command approvals.
+  review it first, then set `agent.command` to its absolute path only after
+  the user explicitly authorizes that exact local command. The wrapper uses
+  Codex app-server with `workspace-write` and `on-request`, and presents
+  command/file approval requests in the local Dashboard. The trigger does
+  not silently grant or bypass those approvals.
 - The first poll establishes a baseline; it never replays historical commits.
 - Every event is deduplicated by `Coordination-Event-Id`, or by commit SHA when
   a legacy commit lacks that trailer.
@@ -43,6 +45,10 @@ python3 trigger.py
 Open <http://127.0.0.1:8765>. The service listens only on loopback.
 
 The dashboard shows the last OBU health result and includes **检测浏览器连接**.
+When the local Agent requests a Codex shell/file permission, the same dashboard
+shows a pending approval card with **允许这一次**、**始终允许（本会话）** and
+**拒绝**. This is the Trigger UI, not a Codex desktop approval card; a detached
+Agent process cannot inject requests into the current Codex task's UI.
 The daemon keeps one long-lived, configuration-stable OBU broker session and periodically pings it;
 when a stale `active.json` points to a deleted socket, it removes only that
 registry entry and retries. A disconnected state is surfaced as `无法连接`

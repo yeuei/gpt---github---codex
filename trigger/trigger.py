@@ -27,6 +27,7 @@ from urllib.parse import unquote
 ROOT = Path(__file__).resolve().parent
 DEFAULT_CONFIG = ROOT / "config.local.json"
 DEFAULT_DB = ROOT / "state.sqlite3"
+APPROVAL_DIR = ROOT / "approval-requests"
 ORIGIN_RE = re.compile(r"^Coordination-Origin:\s*(agent|chatgpt)\s*$", re.M | re.I)
 EVENT_RE = re.compile(r"^Coordination-Event-Id:\s*(\S+)\s*$", re.M | re.I)
 CAUSE_RE = re.compile(r"^Coordination-Caused-By:\s*(\S+)\s*$", re.M | re.I)
@@ -55,6 +56,42 @@ def load_config(path: Path) -> dict[str, Any]:
     if "watch_branches" not in config:
         config["watch_branches"] = "all"
     return config
+
+
+def pending_approval_requests() -> list[dict[str, Any]]:
+    """Read app-server approval requests published by local Agent processes."""
+    requests: list[dict[str, Any]] = []
+    try:
+        paths = sorted(APPROVAL_DIR.glob("*.json"))
+    except OSError:
+        return requests
+    for path in paths:
+        try:
+            item = json.loads(path.read_text(encoding="utf-8"))
+            if item.get("id") and not item.get("decision"):
+                item["file"] = path.name
+                requests.append(item)
+        except (OSError, ValueError, TypeError):
+            continue
+    return requests
+
+
+def resolve_approval_request(request_id: str, decision: str) -> bool:
+    """Resolve one request; the app-server bridge consumes the decision."""
+    if decision not in {"accept", "acceptForSession", "decline", "cancel"}:
+        return False
+    if not re.fullmatch(r"[A-Za-z0-9._-]+", request_id):
+        return False
+    path = APPROVAL_DIR / f"{request_id}.json"
+    try:
+        item = json.loads(path.read_text(encoding="utf-8"))
+        if item.get("decision"):
+            return False
+        item["decision"] = decision
+        path.write_text(json.dumps(item, ensure_ascii=False), encoding="utf-8")
+        return True
+    except (OSError, ValueError, TypeError):
+        return False
 
 
 class Store:
@@ -545,10 +582,24 @@ class Service:
 
 
 HTML = """<!doctype html><meta charset=utf-8><title>GitHub 协作触发器</title>
-<style>body{font:14px system-ui;max-width:1100px;margin:30px auto;padding:0 18px;background:#111;color:#eee}button{padding:8px;margin:3px;border:1px solid #666;border-radius:6px;background:#222;color:#eee;cursor:pointer}button:hover{border-color:#74d99f}.mode{display:flex;align-items:center;gap:12px;padding:14px 16px;margin:14px 0;border:1px solid #555;border-radius:8px;background:#1b1b1b}.mode button{font-size:15px;font-weight:600}.mode .on{color:#74d99f;border-color:#74d99f}.mode .off{color:#ffc76d;border-color:#ffc76d}.mode small{color:#aaa}table{width:100%%;border-collapse:collapse}th,td{padding:8px;border-bottom:1px solid #444;text-align:left;vertical-align:top}.ok{color:#74d99f}.warn{color:#ffc76d}.browser{display:flex;align-items:center;gap:12px;padding:12px 0}.browser .connected{color:#74d99f}.browser .disconnected{color:#ff8a8a}.browser .unknown{color:#ffc76d}.detail{color:#aaa}</style>
+<style>body{font:14px system-ui;max-width:1100px;margin:30px auto;padding:0 18px;background:#111;color:#eee}button{padding:8px;margin:3px;border:1px solid #666;border-radius:6px;background:#222;color:#eee;cursor:pointer}button:hover{border-color:#74d99f}.mode{display:flex;align-items:center;gap:12px;padding:14px 16px;margin:14px 0;border:1px solid #555;border-radius:8px;background:#1b1b1b}.mode button{font-size:15px;font-weight:600}.mode .on{color:#74d99f;border-color:#74d99f}.mode .off{color:#ffc76d;border-color:#ffc76d}.mode small{color:#aaa}table{width:100%%;border-collapse:collapse}th,td{padding:8px;border-bottom:1px solid #444;text-align:left;vertical-align:top}.ok{color:#74d99f}.warn{color:#ffc76d}.browser{display:flex;align-items:center;gap:12px;padding:12px 0}.browser .connected{color:#74d99f}.browser .disconnected{color:#ff8a8a}.browser .unknown{color:#ffc76d}.detail{color:#aaa}.approvals{border:1px solid #ffc76d;border-radius:8px;padding:10px;margin:12px 0;background:#211d14}.approval{border-top:1px solid #554a32;padding:10px 0}.approval:first-child{border-top:0}.approval code{display:block;white-space:pre-wrap;color:#ffd98a;margin:6px 0}</style>
 <h1>GitHub ↔ ChatGPT Web 协作触发器</h1><p>本机确定性服务。默认逐条审批；开启“自动审批模式”后才会自动发送。</p>
 <div id=browser class=browser></div><div id=controls></div><h2>按 PR 查看交接时间线</h2><table><thead><tr><th>发现时间</th><th>PR</th><th>来源</th><th>提交</th><th>状态</th><th>详情与操作</th></tr></thead><tbody id=events></tbody></table>
 <script>const esc=v=>String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));const label={enabled:'总开关',agent_to_chatgpt:'Agent → ChatGPT',chatgpt_to_agent:'ChatGPT → Agent'};const status={detected:'已发现', 'awaiting approval':'等待审批',dispatched:'已执行','needs human':'需要人工处理','skipped: paused':'已跳过：总开关暂停','skipped: agent_to_chatgpt disabled':'已跳过：Agent → ChatGPT 已关闭','skipped: chatgpt_to_agent disabled':'已跳过：ChatGPT → Agent 已关闭'};const origin={agent:'本地 Agent',chatgpt:'远程 ChatGPT'};async function set(k,v){await fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({key:k,value:v})});load()}async function setMode(v){let r=await fetch('/api/mode',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({auto:v})});let d=await r.json();if(!r.ok)alert(d.error||'切换模式失败');load()}async function poll(){await fetch('/api/poll',{method:'POST'});load()}async function approve(k){await fetch('/api/approve/'+encodeURIComponent(k),{method:'POST'});load()}async function checkBrowser(){let b=document.querySelector('#browser');b.innerHTML='浏览器连接：检测中…';let r=await fetch('/api/browser/check',{method:'POST'});let d=await r.json();renderBrowser(d)}function renderBrowser(b){document.querySelector('#browser').innerHTML=`<span class="${esc(b.state)}">● ${esc(b.label)}</span><span>${esc(b.target||'')}</span><span class=detail>${esc(b.detail||'')} ${b.checked_at?'（'+esc(b.checked_at)+'）':''}</span><button onclick="checkBrowser()">检测浏览器连接</button>`}async function load(){let d=await (await fetch('/api/status')).json(),s=d.settings;renderBrowser(d.browser);let c=document.querySelector('#controls');c.innerHTML=`<div class=mode><button class="${d.auto_mode?'on':'off'}" onclick="setMode(${!d.auto_mode})">${d.auto_mode?'✓ 自动审批模式：已开启（自动批准并发送）':'○ 自动审批模式：已关闭（逐条审批）'}</button><small>${d.auto_mode?'新事件和当前等待审批事件会自动处理。':'默认安全模式：每条事件都需要你点击批准；启用自动审批后才会自动发送。'}</small></div>`+['enabled','agent_to_chatgpt','chatgpt_to_agent'].map(k=>`<button onclick="set('${k}',${!s[k]})">${s[k]?'✓ 已开启':'○ 已关闭'}：${label[k]}</button>`).join('')+'<button onclick="poll()">立即检查 GitHub</button>';document.querySelector('#events').innerHTML=d.events.map(e=>{let retry=e.status==='awaiting approval'||e.status==='needs human';return `<tr><td>${esc(e.observed_at)}</td><td>${e.pr_number==null?'未关联':`#${esc(e.pr_number)}`}</td><td>${esc(origin[e.origin]||e.origin)}</td><td>${esc(e.sha.slice(0,8))}<br>${esc(e.subject)}</td><td class="${e.status==='dispatched'?'ok':'warn'}">${esc(status[e.status]||e.status)}</td><td>${esc(e.detail||'')}${retry?`<br><button onclick="approve('${encodeURIComponent(e.event_key)}')">${e.status==='needs human'?'修复后重试':'批准此事件'}</button>`:''}</td></tr>`}).join('')}load();setInterval(load,5000)</script>"""
+HTML += """<script>
+const approvalText = p => `${p.reason || 'Codex 请求执行操作'}\n\n${p.command || '文件变更'}${p.cwd ? '\n工作目录：' + p.cwd : ''}`;
+async function resolveApproval(id, decision) {
+  await fetch('/api/approvals/' + encodeURIComponent(id), {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({decision})});
+  loadApprovals();
+}
+async function loadApprovals() {
+  const box = document.querySelector('#approvals') || (() => { const x=document.createElement('div'); x.id='approvals'; x.className='approvals'; document.querySelector('#controls').after(x); return x; })();
+  const data = await (await fetch('/api/approvals')).json();
+  box.style.display = data.requests.length ? 'block' : 'none';
+  box.innerHTML = data.requests.length ? '<strong>Codex 待审批操作（不是自动审批模式）</strong>' + data.requests.map(r => `<div class=approval><code>${esc(approvalText(r.params||{}))}</code><button onclick="resolveApproval('${esc(r.id)}','accept')">允许这一次</button><button onclick="resolveApproval('${esc(r.id)}','acceptForSession')">始终允许（本会话）</button><button onclick="resolveApproval('${esc(r.id)}','decline')">拒绝</button></div>`).join('') : '';
+}
+loadApprovals(); setInterval(loadApprovals, 1000);
+</script>"""
 
 
 def handler(service: Service):
@@ -558,6 +609,7 @@ def handler(service: Service):
             self.send_response(status); self.send_header("Content-Type", content_type); self.send_header("Content-Length", str(len(body))); self.end_headers(); self.wfile.write(body)
         def do_GET(self):
             if self.path == "/": return self.reply(200, HTML, "text/html; charset=utf-8")
+            if self.path == "/api/approvals": return self.reply(200, {"requests": pending_approval_requests()})
             if self.path == "/api/status":
                 data = service.store.snapshot(); data["last_error"] = service.last_error; data["browser"] = service.browser_status; data["auto_mode"] = service.auto_mode(); return self.reply(200, data)
             return self.reply(404, {"error": "not found"})
@@ -569,6 +621,12 @@ def handler(service: Service):
                 if not isinstance(data.get("auto"), bool):
                     return self.reply(400, {"error": "invalid auto mode"})
                 return self.reply(200, service.set_auto_mode(data["auto"]))
+            if self.path.startswith("/api/approvals/"):
+                request_id = unquote(self.path.removeprefix("/api/approvals/"))
+                length = int(self.headers.get("Content-Length", "0")); data = json.loads(self.rfile.read(length))
+                if not resolve_approval_request(request_id, data.get("decision", "")):
+                    return self.reply(HTTPStatus.CONFLICT, {"error": "approval request is missing or already resolved"})
+                return self.reply(200, {"ok": True})
             if self.path.startswith("/api/approve/"):
                 event_key = unquote(self.path.removeprefix("/api/approve/"))
                 event = service.store.event(event_key)
