@@ -261,7 +261,7 @@ class OpenBrowserUse:
         # ChatGPT uses a ProseMirror editor. Directly assigning textContent makes
         # a visually plausible DOM change but does not update the app's draft.
         # Focus the exact editor and use CDP's native text input instead.
-        editor = "#prompt-textarea[contenteditable=\\\"true\\\"]"
+        editor = '#prompt-textarea[contenteditable="true"]'
         handoff_ready = False
         try:
             before = self._evaluate(common, tab_id, """(() => {
