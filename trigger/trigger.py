@@ -22,7 +22,7 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import unquote
 
 ROOT = Path(__file__).resolve().parent
 DEFAULT_CONFIG = ROOT / "config.local.json"
@@ -323,7 +323,7 @@ HTML = """<!doctype html><meta charset=utf-8><title>Handoff Trigger</title>
 <style>body{font:14px system-ui;max-width:1100px;margin:30px auto;padding:0 18px;background:#111;color:#eee}button{padding:8px;margin:3px}table{width:100%%;border-collapse:collapse}th,td{padding:8px;border-bottom:1px solid #444;text-align:left;vertical-align:top}.ok{color:#74d99f}.warn{color:#ffc76d}</style>
 <h1>GitHub ↔ ChatGPT Web Trigger</h1><p>Local deterministic service. Browser send remains opt-in.</p>
 <div id=controls></div><h2>Per-PR handoff timeline</h2><table><thead><tr><th>Time</th><th>PR</th><th>Origin</th><th>Commit</th><th>Status</th><th>Detail</th></tr></thead><tbody id=events></tbody></table>
-<script>async function set(k,v){await fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({key:k,value:v})});load()}async function poll(){await fetch('/api/poll',{method:'POST'});load()}async function approve(k){await fetch('/api/approve/'+encodeURIComponent(k),{method:'POST'});load()}async function load(){let d=await (await fetch('/api/status')).json(),s=d.settings;let c=document.querySelector('#controls');c.innerHTML=['enabled','agent_to_chatgpt','chatgpt_to_agent','approval_required','auto_submit'].map(k=>`<button onclick="set('${k}',${!s[k]})">${s[k]?'✓':'○'} ${k}</button>`).join('')+'<button onclick="poll()">Poll now</button>';document.querySelector('#events').innerHTML=d.events.map(e=>`<tr><td>${e.observed_at}</td><td>#${e.pr_number??'—'}</td><td>${e.origin}</td><td>${e.sha.slice(0,8)}<br>${e.subject}</td><td class="${e.status==='dispatched'?'ok':'warn'}">${e.status}</td><td>${e.detail||''}${e.status==='awaiting approval'?`<br><button onclick="approve('${e.event_key}')">Approve this event</button>`:''}</td></tr>`).join('')}load();setInterval(load,5000)</script>"""
+<script>const esc=v=>String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));async function set(k,v){await fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({key:k,value:v})});load()}async function poll(){await fetch('/api/poll',{method:'POST'});load()}async function approve(k){await fetch('/api/approve/'+encodeURIComponent(k),{method:'POST'});load()}async function load(){let d=await (await fetch('/api/status')).json(),s=d.settings;let c=document.querySelector('#controls');c.innerHTML=['enabled','agent_to_chatgpt','chatgpt_to_agent','approval_required','auto_submit'].map(k=>`<button onclick="set('${k}',${!s[k]})">${s[k]?'✓':'○'} ${k}</button>`).join('')+'<button onclick="poll()">Poll now</button>';document.querySelector('#events').innerHTML=d.events.map(e=>{let retry=e.status==='awaiting approval'||e.status==='needs human';return `<tr><td>${esc(e.observed_at)}</td><td>#${esc(e.pr_number??'—')}</td><td>${esc(e.origin)}</td><td>${esc(e.sha.slice(0,8))}<br>${esc(e.subject)}</td><td class="${e.status==='dispatched'?'ok':'warn'}">${esc(e.status)}</td><td>${esc(e.detail||'')}${retry?`<br><button onclick="approve('${encodeURIComponent(e.event_key)}')">${e.status==='needs human'?'Retry after fixing setup':'Approve this event'}</button>`:''}</td></tr>`}).join('')}load();setInterval(load,5000)</script>"""
 
 
 def handler(service: Service):
@@ -339,10 +339,10 @@ def handler(service: Service):
         def do_POST(self):
             if self.path == "/api/poll": return self.reply(200, service.poll_once())
             if self.path.startswith("/api/approve/"):
-                event_key = self.path.removeprefix("/api/approve/")
+                event_key = unquote(self.path.removeprefix("/api/approve/"))
                 event = service.store.event(event_key)
-                if not event or event["status"] != "awaiting approval":
-                    return self.reply(HTTPStatus.CONFLICT, {"error": "event is not awaiting approval"})
+                if not event or event["status"] not in {"awaiting approval", "needs human"}:
+                    return self.reply(HTTPStatus.CONFLICT, {"error": "event cannot be approved or retried"})
                 service.dispatch_event(event_key); return self.reply(200, {"ok": True})
             if self.path == "/api/settings":
                 length = int(self.headers.get("Content-Length", "0")); data = json.loads(self.rfile.read(length))
