@@ -95,6 +95,16 @@ class Store:
                             (key, json.dumps(value)))
             self.db.commit()
 
+    def set_settings(self, values: dict[str, Any]) -> None:
+        """Update related settings in one SQLite transaction."""
+        with self.lock:
+            for key, value in values.items():
+                self.db.execute(
+                    "insert into settings values (?, ?) on conflict(key) do update set value=excluded.value",
+                    (key, json.dumps(value)),
+                )
+            self.db.commit()
+
     def cursor(self, ref: str) -> str | None:
         with self.lock:
             row = self.db.execute("select value from cursors where key=?", (f"git_head:{ref}",)).fetchone()
@@ -421,8 +431,7 @@ class Service:
         per-event approval and an actual ChatGPT Web submit. Turning it off
         restores the safe fill-only approval workflow.
         """
-        self.store.set_setting("approval_required", not enabled)
-        self.store.set_setting("auto_submit", enabled)
+        self.store.set_settings({"approval_required": not enabled, "auto_submit": enabled})
         dispatched = []
         if enabled:
             for event in self.store.pending_events():
