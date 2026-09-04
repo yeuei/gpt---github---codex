@@ -65,6 +65,23 @@ class TriggerTests(unittest.TestCase):
                                  "status": status})
             self.assertEqual([event["event_key"] for event in store.pending_events()], ["await"])
 
+    def test_auto_mode_submits_verified_fill_only_draft_once(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / "repo"; repo.mkdir()
+            config = {"handoff_repo": str(repo), "remote": "origin", "branch": "main", "repository": "owner/repo",
+                      "chatgpt": {}, "agent": {}}
+            store = trigger.Store(Path(directory) / "state.sqlite3")
+            store.add_event({"event_key": "evt-filled", "sha": "b" * 40, "ref": "origin/feature", "pr_number": None,
+                             "origin": "agent", "caused_by": None, "subject": "filled", "observed_at": trigger.now(),
+                             "status": "dispatched"})
+            store.finish("evt-filled", "dispatched", "filled; verified; waiting for user submit")
+            service = trigger.Service(config, store)
+            calls = []
+            service.dispatch_event = lambda event_key, allow_fill_only_resubmit=False: calls.append((event_key, allow_fill_only_resubmit))
+            result = service.set_auto_mode(True)
+            self.assertEqual(result["drained_event_keys"], ["evt-filled"])
+            self.assertEqual(calls, [("evt-filled", True)])
+
     def test_wake_prompt_preserves_actual_event_id(self):
         with tempfile.TemporaryDirectory() as directory:
             repo = Path(directory) / "repo"; repo.mkdir()

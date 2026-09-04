@@ -16,9 +16,9 @@ coordination trailers, and writes its audit trail to local SQLite—not Git.
   `awaiting approval` events are drained once. The user is intentionally
   choosing unattended external actions by pressing this button.
 - Turning the mode off restores per-event approval and fill-only browser
-  behavior (`approval_required=true`, `auto_submit=false`). Events already
-  marked `dispatched` are never resent; `needs human` failures are not
-  automatically retried.
+  behavior (`approval_required=true`, `auto_submit=false`). A previously
+  verified fill-only draft may be submitted once when auto mode is enabled;
+  submitted events and `needs human` failures are never automatically retried.
 - `agent → ChatGPT Web` uses the `open-browser-use` CLI with a fixed,
   configured conversation URL. The default is fill-only; submitting is opt-in.
 - `ChatGPT Web → agent` starts only the user-configured local command. An empty

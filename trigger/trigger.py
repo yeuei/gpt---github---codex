@@ -149,6 +149,15 @@ class Store:
             ).fetchall()
         return [dict(row) for row in rows]
 
+    def fill_only_events(self) -> list[dict[str, Any]]:
+        """Return verified drafts that are safe to submit once in auto mode."""
+        with self.lock:
+            rows = self.db.execute(
+                "select * from events where status='dispatched' and detail=? order by id",
+                ("filled; verified; waiting for user submit",),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
     def snapshot(self) -> dict[str, Any]:
         with self.lock:
             rows = self.db.execute("select * from events order by id desc limit 200").fetchall()
@@ -441,12 +450,21 @@ class Service:
         restores the safe fill-only approval workflow.
         """
         self.store.set_settings({"approval_required": not enabled, "auto_submit": enabled})
-        dispatched = []
-        if enabled:
-            for event in self.store.pending_events():
-                self.dispatch_event(event["event_key"])
-                dispatched.append(event["event_key"])
+        dispatched = self.drain_auto_mode() if enabled else []
         return {"ok": True, "auto_mode": enabled, "drained_event_keys": dispatched}
+
+    def drain_auto_mode(self) -> list[str]:
+        """Route approvals and submit verified drafts while unattended mode is on."""
+        if not self.auto_mode():
+            return []
+        event_keys = [event["event_key"] for event in self.store.pending_events()]
+        for event_key in event_keys:
+            self.dispatch_event(event_key)
+        fill_only_keys = [event["event_key"] for event in self.store.fill_only_events()]
+        for event_key in fill_only_keys:
+            self.dispatch_event(event_key, allow_fill_only_resubmit=True)
+        event_keys.extend(fill_only_keys)
+        return event_keys
 
     def wake_prompt(self, commit: Commit, pr: int | None, event_id: str | None = None, ref: str = "") -> str:
         follow_up = ("本事件尚未关联 PR。请检查上述分支是否只包含一个可关闭目标；若是且你拥有写权限，"
@@ -491,11 +509,13 @@ class Service:
             return
         self.dispatch_event(commit.event_id)
 
-    def dispatch_event(self, event_key: str) -> None:
+    def dispatch_event(self, event_key: str, allow_fill_only_resubmit: bool = False) -> None:
         event = self.store.event(event_key)
         if not event:
             raise RuntimeError("event not found")
-        if event["status"] == "dispatched":
+        if event["status"] == "dispatched" and not allow_fill_only_resubmit:
+            return
+        if event["status"] == "dispatched" and event["detail"] != "filled; verified; waiting for user submit":
             return
         try:
             if event["origin"] == "agent":
@@ -575,7 +595,7 @@ def main() -> None:
     if args.once: print(json.dumps(service.poll_once())); return
     def loop():
         while True:
-            service.poll_once(); service.check_browser(); time.sleep(max(3, int(config.get("poll_interval_seconds", 15))))
+            service.poll_once(); service.drain_auto_mode(); service.check_browser(); time.sleep(max(3, int(config.get("poll_interval_seconds", 15))))
     threading.Thread(target=loop, daemon=True).start()
     server = ThreadingHTTPServer(("127.0.0.1", args.port), handler(service))
     print(f"Dashboard: http://127.0.0.1:{args.port}"); server.serve_forever()
