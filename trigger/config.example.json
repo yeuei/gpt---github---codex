@@ -1,0 +1,15 @@
+{
+  "handoff_repo": "..",
+  "remote": "origin",
+  "branch": "main",
+  "repository": "yeuei/gpt---github---codex",
+  "poll_interval_seconds": 15,
+  "chatgpt": {
+    "conversation_url": "https://chatgpt.com/c/REPLACE_WITH_EXISTING_CONVERSATION_ID",
+    "browser": "chrome",
+    "profile": "Default"
+  },
+  "agent": {
+    "command": []
+  }
+}

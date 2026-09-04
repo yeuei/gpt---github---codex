@@ -1,4 +1,4 @@
-schema_version: coordination.v1
+schema_version: coordination.v2
 
 project:
   project_id: "gpt---github---codex"
@@ -13,7 +13,7 @@ clients:
     role: "local_executor"
 
 event_protocol:
-  enabled: false
+  enabled: true
   required_fields:
     - event_id
     - repository
@@ -38,6 +38,18 @@ routing:
       - agent
     suppress:
       - chatgpt
+
+local_trigger:
+  implementation: "trigger/trigger.py"
+  dashboard_bind: "127.0.0.1"
+  dashboard_port: 8765
+  default_poll_interval_seconds: 15
+  default_approval_required: true
+  default_auto_submit: false
+  browser_adapter: "open-browser-use"
+  chatgpt_mode: "web_chat"
+  configuration_file: "trigger/config.local.json"
+  configuration_is_gitignored: true
 
 origin_values:
   - agent

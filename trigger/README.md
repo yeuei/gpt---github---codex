@@ -1,0 +1,50 @@
+# Local Trigger
+
+This is a local deterministic daemon for the `yeuei/gpt---github---codex`
+handoff repository. It polls a configured remote branch, reads only explicit
+coordination trailers, and writes its audit trail to local SQLite—not Git.
+
+## Safety and routing
+
+- Global pause, each direction, approval mode, and `auto_submit` are separate dashboard toggles.
+- **Approval mode is the default.** A detected event enters `awaiting approval`;
+  select **Approve this event** before the daemon touches ChatGPT or launches
+  the configured Agent command.
+- `agent → ChatGPT Web` uses the `open-browser-use` CLI with a fixed,
+  configured conversation URL. The default is fill-only; submitting is opt-in.
+- `ChatGPT Web → agent` starts only the user-configured local command. An empty
+  command causes a visible `needs human` event rather than a surprise process.
+- The first poll establishes a baseline; it never replays historical commits.
+- Every event is deduplicated by `Coordination-Event-Id`, or by commit SHA when
+  a legacy commit lacks that trailer.
+
+## Install and run
+
+```bash
+cd trigger
+cp config.example.json config.local.json
+# Set conversation_url; leave agent.command empty until ready.
+python3 trigger.py
+```
+
+Open <http://127.0.0.1:8765>. The service listens only on loopback.
+
+Before enabling the browser direction, the user must manually run
+`open-browser-use setup` and enable the Chrome extension in the chosen profile.
+The daemon validates the configured profile with `open-browser-use ping`; it
+does not choose another profile or inspect browser credentials.
+
+## Event contract
+
+An event-bearing commit ends with:
+
+```text
+Coordination-Origin: agent | chatgpt
+Coordination-Event-Id: stable-event-id
+Coordination-Caused-By: parent-event-id   # optional
+```
+
+The event payload is only a wake-up. Both parties must re-read GitHub HEAD and
+the relevant coordination files before acting. A `needs human` status captures
+missing browser setup, a missing conversation URL, or an unconfigured agent
+command without retrying in a loop.
