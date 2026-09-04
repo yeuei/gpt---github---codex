@@ -272,7 +272,11 @@ class OpenBrowserUse:
                 raise RuntimeError("could not read ChatGPT composer state")
             if before.get("draftLength", 0):
                 raise RuntimeError("ChatGPT composer already contains a draft; refusing to overwrite it")
-            self._cdp(common, tab_id, "Input.insertText", {"text": message})
+            inserted = self._evaluate(common, tab_id, """(() => {
+              const e=document.querySelector(%s); e.focus();
+              return {inserted:document.execCommand('insertText', false, %s)}; })()""" % (json.dumps(editor), json.dumps(message)))
+            if not isinstance(inserted, dict) or not inserted.get("inserted"):
+                raise RuntimeError("browser refused to insert the ChatGPT handoff draft")
             verified = self._evaluate(common, tab_id, """(() => {
               const e=document.querySelector(%s); const actual=(e?.innerText||e?.textContent||'').trim();
               return {length:actual.length, matches:actual===%s}; })()""" % (json.dumps(editor), json.dumps(message.strip())))

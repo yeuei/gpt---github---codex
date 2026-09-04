@@ -66,6 +66,8 @@ class TriggerTests(unittest.TestCase):
                     params = command[command.index("--params") + 1]
                     if "draftLength" in params:
                         return '{"result":{"result":{"type":"object","value":{"draftLength":0}}}}'
+                    if "execCommand" in params:
+                        return '{"result":{"result":{"type":"object","value":{"inserted":true}}}}'
                     return '{"result":{"result":{"type":"object","value":{"length":12,"matches":true}}}}'
                 if method == "Input.insertText":
                     return '{"result":{}}'
@@ -77,7 +79,7 @@ class TriggerTests(unittest.TestCase):
         finally:
             trigger.run = original
         methods = [call[call.index("--method") + 1] for call in calls if call[:2] == ["open-browser-use", "cdp"]]
-        self.assertEqual(methods, ["Runtime.evaluate", "Input.insertText", "Runtime.evaluate"])
+        self.assertEqual(methods, ["Runtime.evaluate", "Runtime.evaluate", "Runtime.evaluate"])
         self.assertTrue(any(call[:2] == ["open-browser-use", "turn-ended"] for call in calls))
 
     def test_browser_rpc_errors_are_not_treated_as_success(self):
