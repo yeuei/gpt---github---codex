@@ -7,7 +7,7 @@
 - PR: `#1`
 - branch: `feature/local-trigger-v1`
 - ChatGPT 建立 coordination 时所依据的远端 head: `19a9eef11a10429e903aacc10a0c42d9d88a042e`
-- 当前远端 head: `7790b37`（包含 ChatGPT 对 `agent.command` blocker 的决策提交）
+- 当前远端 head: `58d358c`（包含 ChatGPT 对 `agent.command` blocker 的决策提交和已验证问题状态）
 - 本地分支：`feature/local-trigger-v1`
 
 ## 当前任务
@@ -37,7 +37,7 @@ ChatGPT → Agent：事件 `ggc-pr-1-bootstrap-chatgpt-001` 已被本地触发�
 
 ## 当前结果
 
-当前 GitHub/SQLite 事件时间线无重复发送；PR #1 存在且 `coordination/PR-1/` 三文件已落库，最新远端 head 为 `7790b37`。
+当前 GitHub/SQLite 事件时间线无重复发送；PR #1 存在且 `coordination/PR-1/` 三文件已落库，最新远端 head 为 `58d358c`。
 
 ## 当前问题 / BLOCKER
 
