@@ -80,7 +80,27 @@ class TriggerTests(unittest.TestCase):
             trigger.run = original
         methods = [call[call.index("--method") + 1] for call in calls if call[:2] == ["open-browser-use", "cdp"]]
         self.assertEqual(methods, ["Runtime.evaluate", "Runtime.evaluate", "Runtime.evaluate"])
-        self.assertTrue(any(call[:2] == ["open-browser-use", "turn-ended"] for call in calls))
+        self.assertTrue(any(call[:2] == ["open-browser-use", "finalize-tabs"] for call in calls))
+
+    def test_browser_health_reports_connected_target(self):
+        config = {"chatgpt": {"conversation_url": "https://chatgpt.com/c/test", "browser": "chrome", "profile": "Default"}}
+        adapter = trigger.OpenBrowserUse(config)
+        original = trigger.run
+
+        def fake_run(command, cwd=None, timeout=30):
+            if command[1:3] == ["profiles", "--connected"]:
+                return '[{"browser":"chrome","directory":"Default","target":"chrome:Default"}]'
+            if command[1] == "ping":
+                return "pong"
+            return "{}"
+
+        try:
+            trigger.run = fake_run
+            result = adapter.check_connection()
+        finally:
+            trigger.run = original
+        self.assertEqual(result["state"], "connected")
+        self.assertEqual(result["target"], "chrome:Default")
 
     def test_browser_rpc_errors_are_not_treated_as_success(self):
         with self.assertRaisesRegex(RuntimeError, "already part of browser session"):

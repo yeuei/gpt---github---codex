@@ -29,6 +29,12 @@ python3 trigger.py
 
 Open <http://127.0.0.1:8765>. The service listens only on loopback.
 
+The dashboard shows the last OBU health result and includes **检测浏览器连接**.
+The daemon keeps one long-lived OBU broker session and periodically pings it;
+when a stale `active.json` points to a deleted socket, it removes only that
+registry entry and retries. A disconnected state is surfaced as `无法连接`
+with the exact CLI error so the user can reconnect the selected Chrome profile.
+
 Before enabling the browser direction, the user must manually run
 `open-browser-use setup` and enable the Chrome extension in the chosen profile.
 The daemon validates the configured profile with `open-browser-use ping`; it

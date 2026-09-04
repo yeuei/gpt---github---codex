@@ -201,6 +201,63 @@ class OpenBrowserUse:
     """Fixed CLI adapter. No LLM is involved in this dispatch path."""
     def __init__(self, config: dict[str, Any]):
         self.chat = config["chatgpt"]
+        # Keep one broker session for the lifetime of the local trigger. Ending
+        # the OBU turn after every event can leave active.json pointing at a
+        # broker that has already exited, making the next event look offline.
+        self.session_id = f"obu-trigger-{uuid.uuid4().hex[:12]}"
+        self._health_lock = threading.Lock()
+
+    def _common(self) -> list[str]:
+        return ["--session-id", self.session_id, "--browser", self.chat.get("browser", "chrome"),
+                "--profile", self.chat.get("profile", "Default")]
+
+    @staticmethod
+    def _clear_stale_registry() -> bool:
+        """Remove only an active registry whose socket path is gone."""
+        registry = Path("/tmp/open-browser-use/active.json")
+        try:
+            data = json.loads(registry.read_text())
+            socket_path = Path(str(data.get("socketPath", "")))
+            if socket_path and not socket_path.exists():
+                registry.unlink()
+                return True
+        except (FileNotFoundError, OSError, ValueError, TypeError):
+            return False
+        return False
+
+    def _ping(self, common: list[str]) -> None:
+        try:
+            run(["open-browser-use", "ping", *common], timeout=15)
+        except Exception as first_error:
+            # v0.1.36+ can repair a missing registry by scanning live sockets,
+            # but a registry pointing at a deleted socket must be removed first.
+            if not self._clear_stale_registry():
+                raise
+            try:
+                run(["open-browser-use", "ping", *common], timeout=15)
+            except Exception:
+                raise first_error
+
+    def check_connection(self) -> dict[str, Any]:
+        """Return a UI-safe health snapshot without inspecting browser data."""
+        with self._health_lock:
+            checked_at = now()
+            try:
+                profiles_raw = run(["open-browser-use", "profiles", "--connected", "--json"], timeout=10)
+                profiles = json.loads(profiles_raw)
+                browser = self.chat.get("browser", "chrome").lower()
+                profile = self.chat.get("profile", "Default").lower()
+                matching = [item for item in profiles if item.get("browser", "").lower() == browser and
+                            (item.get("directory", "").lower() == profile or item.get("displayName", "").lower() == profile)]
+                if not matching:
+                    raise RuntimeError(f"未找到已连接的 Chrome 配置：{browser}/{self.chat.get('profile', 'Default')}")
+                self._ping(self._common())
+                return {"state": "connected", "label": "已连接", "checked_at": checked_at,
+                        "target": matching[0].get("target", f"{browser}:{profile}"), "detail": "OBU ping 成功"}
+            except Exception as exc:
+                return {"state": "disconnected", "label": "无法连接", "checked_at": checked_at,
+                        "target": f"{self.chat.get('browser', 'chrome')}:{self.chat.get('profile', 'Default')}",
+                        "detail": str(exc)[:500]}
 
     @staticmethod
     def _result(raw: str, operation: str) -> Any:
@@ -234,11 +291,9 @@ class OpenBrowserUse:
         url = self.chat.get("conversation_url", "")
         if "REPLACE_" in url or not url.startswith("https://chatgpt.com/"):
             raise RuntimeError("configure chatgpt.conversation_url before enabling agent -> ChatGPT")
-        session = f"obu-handoff-{uuid.uuid4().hex[:12]}"
-        common = ["--session-id", session, "--browser", self.chat.get("browser", "chrome"),
-                  "--profile", self.chat.get("profile", "Default")]
+        common = self._common()
         # This tests that the explicitly configured browser/profile is connected.
-        run(["open-browser-use", "ping", *common], timeout=15)
+        self._ping(common)
         tabs_result = self._rpc(
             ["open-browser-use", "call", *common, "--method", "getUserTabs", "--params", "{}"],
             "getUserTabs",
@@ -318,7 +373,8 @@ class OpenBrowserUse:
             status = "handoff" if handoff_ready else "deliverable"
             run(["open-browser-use", "finalize-tabs", *common,
                  "--keep", json.dumps([{"tabId": tab_id, "status": status}])], timeout=15)
-            run(["open-browser-use", "turn-ended", *common], timeout=15)
+            # Keep the broker session alive for subsequent events. The trigger
+            # is a long-running local service, not a one-shot browser turn.
 
 
 class Service:
@@ -326,6 +382,13 @@ class Service:
         self.config, self.store = config, store
         self.git, self.browser = GitSource(config), OpenBrowserUse(config)
         self.last_error = ""
+        self.browser_status: dict[str, Any] = {"state": "unknown", "label": "未检测", "checked_at": None,
+                                               "target": f"{self.browser.chat.get('browser', 'chrome')}:{self.browser.chat.get('profile', 'Default')}",
+                                               "detail": "尚未执行连接检测"}
+
+    def check_browser(self) -> dict[str, Any]:
+        self.browser_status = self.browser.check_connection()
+        return self.browser_status
 
     def wake_prompt(self, commit: Commit, pr: int | None, event_id: str | None = None, ref: str = "") -> str:
         follow_up = ("本事件尚未关联 PR。请检查上述分支是否只包含一个可关闭目标；若是且你拥有写权限，"
@@ -404,10 +467,10 @@ class Service:
 
 
 HTML = """<!doctype html><meta charset=utf-8><title>GitHub 协作触发器</title>
-<style>body{font:14px system-ui;max-width:1100px;margin:30px auto;padding:0 18px;background:#111;color:#eee}button{padding:8px;margin:3px}table{width:100%%;border-collapse:collapse}th,td{padding:8px;border-bottom:1px solid #444;text-align:left;vertical-align:top}.ok{color:#74d99f}.warn{color:#ffc76d}</style>
+<style>body{font:14px system-ui;max-width:1100px;margin:30px auto;padding:0 18px;background:#111;color:#eee}button{padding:8px;margin:3px}table{width:100%%;border-collapse:collapse}th,td{padding:8px;border-bottom:1px solid #444;text-align:left;vertical-align:top}.ok{color:#74d99f}.warn{color:#ffc76d}.browser{display:flex;align-items:center;gap:12px;padding:12px 0}.browser .connected{color:#74d99f}.browser .disconnected{color:#ff8a8a}.browser .unknown{color:#ffc76d}.detail{color:#aaa}</style>
 <h1>GitHub ↔ ChatGPT Web 协作触发器</h1><p>本机确定性服务。浏览器操作和消息发送均须由你明确批准。</p>
-<div id=controls></div><h2>按 PR 查看交接时间线</h2><table><thead><tr><th>发现时间</th><th>PR</th><th>来源</th><th>提交</th><th>状态</th><th>详情与操作</th></tr></thead><tbody id=events></tbody></table>
-<script>const esc=v=>String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));const label={enabled:'总开关',agent_to_chatgpt:'Agent → ChatGPT',chatgpt_to_agent:'ChatGPT → Agent',approval_required:'逐条审批',auto_submit:'批准后自动发送'};const status={detected:'已发现', 'awaiting approval':'等待审批',dispatched:'已执行','needs human':'需要人工处理','skipped: paused':'已跳过：总开关暂停','skipped: agent_to_chatgpt disabled':'已跳过：Agent → ChatGPT 已关闭','skipped: chatgpt_to_agent disabled':'已跳过：ChatGPT → Agent 已关闭'};const origin={agent:'本地 Agent',chatgpt:'远程 ChatGPT'};async function set(k,v){await fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({key:k,value:v})});load()}async function poll(){await fetch('/api/poll',{method:'POST'});load()}async function approve(k){await fetch('/api/approve/'+encodeURIComponent(k),{method:'POST'});load()}async function load(){let d=await (await fetch('/api/status')).json(),s=d.settings;let c=document.querySelector('#controls');c.innerHTML=['enabled','agent_to_chatgpt','chatgpt_to_agent','approval_required','auto_submit'].map(k=>`<button onclick="set('${k}',${!s[k]})">${s[k]?'✓ 已开启':'○ 已关闭'}：${label[k]}</button>`).join('')+'<button onclick="poll()">立即检查 GitHub</button>';document.querySelector('#events').innerHTML=d.events.map(e=>{let retry=e.status==='awaiting approval'||e.status==='needs human';return `<tr><td>${esc(e.observed_at)}</td><td>${e.pr_number==null?'未关联':`#${esc(e.pr_number)}`}</td><td>${esc(origin[e.origin]||e.origin)}</td><td>${esc(e.sha.slice(0,8))}<br>${esc(e.subject)}</td><td class="${e.status==='dispatched'?'ok':'warn'}">${esc(status[e.status]||e.status)}</td><td>${esc(e.detail||'')}${retry?`<br><button onclick="approve('${encodeURIComponent(e.event_key)}')">${e.status==='needs human'?'修复后重试':'批准此事件'}</button>`:''}</td></tr>`}).join('')}load();setInterval(load,5000)</script>"""
+<div id=browser class=browser></div><div id=controls></div><h2>按 PR 查看交接时间线</h2><table><thead><tr><th>发现时间</th><th>PR</th><th>来源</th><th>提交</th><th>状态</th><th>详情与操作</th></tr></thead><tbody id=events></tbody></table>
+<script>const esc=v=>String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));const label={enabled:'总开关',agent_to_chatgpt:'Agent → ChatGPT',chatgpt_to_agent:'ChatGPT → Agent',approval_required:'逐条审批',auto_submit:'批准后自动发送'};const status={detected:'已发现', 'awaiting approval':'等待审批',dispatched:'已执行','needs human':'需要人工处理','skipped: paused':'已跳过：总开关暂停','skipped: agent_to_chatgpt disabled':'已跳过：Agent → ChatGPT 已关闭','skipped: chatgpt_to_agent disabled':'已跳过：ChatGPT → Agent 已关闭'};const origin={agent:'本地 Agent',chatgpt:'远程 ChatGPT'};async function set(k,v){await fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({key:k,value:v})});load()}async function poll(){await fetch('/api/poll',{method:'POST'});load()}async function approve(k){await fetch('/api/approve/'+encodeURIComponent(k),{method:'POST'});load()}async function checkBrowser(){let b=document.querySelector('#browser');b.innerHTML='浏览器连接：检测中…';let r=await fetch('/api/browser/check',{method:'POST'});let d=await r.json();renderBrowser(d)}function renderBrowser(b){document.querySelector('#browser').innerHTML=`<span class="${esc(b.state)}">● ${esc(b.label)}</span><span>${esc(b.target||'')}</span><span class=detail>${esc(b.detail||'')} ${b.checked_at?'（'+esc(b.checked_at)+'）':''}</span><button onclick="checkBrowser()">检测浏览器连接</button>`}async function load(){let d=await (await fetch('/api/status')).json(),s=d.settings;renderBrowser(d.browser);let c=document.querySelector('#controls');c.innerHTML=['enabled','agent_to_chatgpt','chatgpt_to_agent','approval_required','auto_submit'].map(k=>`<button onclick="set('${k}',${!s[k]})">${s[k]?'✓ 已开启':'○ 已关闭'}：${label[k]}</button>`).join('')+'<button onclick="poll()">立即检查 GitHub</button>';document.querySelector('#events').innerHTML=d.events.map(e=>{let retry=e.status==='awaiting approval'||e.status==='needs human';return `<tr><td>${esc(e.observed_at)}</td><td>${e.pr_number==null?'未关联':`#${esc(e.pr_number)}`}</td><td>${esc(origin[e.origin]||e.origin)}</td><td>${esc(e.sha.slice(0,8))}<br>${esc(e.subject)}</td><td class="${e.status==='dispatched'?'ok':'warn'}">${esc(status[e.status]||e.status)}</td><td>${esc(e.detail||'')}${retry?`<br><button onclick="approve('${encodeURIComponent(e.event_key)}')">${e.status==='needs human'?'修复后重试':'批准此事件'}</button>`:''}</td></tr>`}).join('')}load();setInterval(load,5000)</script>"""
 
 
 def handler(service: Service):
@@ -418,10 +481,11 @@ def handler(service: Service):
         def do_GET(self):
             if self.path == "/": return self.reply(200, HTML, "text/html; charset=utf-8")
             if self.path == "/api/status":
-                data = service.store.snapshot(); data["last_error"] = service.last_error; return self.reply(200, data)
+                data = service.store.snapshot(); data["last_error"] = service.last_error; data["browser"] = service.browser_status; return self.reply(200, data)
             return self.reply(404, {"error": "not found"})
         def do_POST(self):
             if self.path == "/api/poll": return self.reply(200, service.poll_once())
+            if self.path == "/api/browser/check": return self.reply(200, service.check_browser())
             if self.path.startswith("/api/approve/"):
                 event_key = unquote(self.path.removeprefix("/api/approve/"))
                 event = service.store.event(event_key)
@@ -448,7 +512,7 @@ def main() -> None:
     if args.once: print(json.dumps(service.poll_once())); return
     def loop():
         while True:
-            service.poll_once(); time.sleep(max(3, int(config.get("poll_interval_seconds", 15))))
+            service.poll_once(); service.check_browser(); time.sleep(max(3, int(config.get("poll_interval_seconds", 15))))
     threading.Thread(target=loop, daemon=True).start()
     server = ThreadingHTTPServer(("127.0.0.1", args.port), handler(service))
     print(f"Dashboard: http://127.0.0.1:{args.port}"); server.serve_forever()
