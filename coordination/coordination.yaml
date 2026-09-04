@@ -49,6 +49,9 @@ local_trigger:
   default_poll_interval_seconds: 15
   default_approval_required: true
   default_auto_submit: false
+  auto_mode_ui: "自动审批模式"
+  auto_mode_default: false
+  auto_mode_endpoint: "/api/mode"
   browser_adapter: "open-browser-use"
   chatgpt_mode: "web_chat"
   configuration_file: "trigger/config.local.json"

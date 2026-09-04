@@ -6,10 +6,19 @@ coordination trailers, and writes its audit trail to local SQLite—not Git.
 
 ## Safety and routing
 
-- Global pause, each direction, approval mode, and `auto_submit` are separate dashboard toggles.
+- Global pause and each direction remain separate dashboard toggles. The dashboard also
+  has one explicit **自动审批模式** button that couples the approval gate and submit behavior.
 - **Approval mode is the default.** A detected event enters `awaiting approval`;
   select **Approve this event** before the daemon touches ChatGPT or launches
   the configured Agent command.
+- When **自动审批模式** is enabled, `approval_required=false` and
+  `auto_submit=true`: new events are routed immediately, and existing
+  `awaiting approval` events are drained once. The user is intentionally
+  choosing unattended external actions by pressing this button.
+- Turning the mode off restores per-event approval and fill-only browser
+  behavior (`approval_required=true`, `auto_submit=false`). Events already
+  marked `dispatched` are never resent; `needs human` failures are not
+  automatically retried.
 - `agent → ChatGPT Web` uses the `open-browser-use` CLI with a fixed,
   configured conversation URL. The default is fill-only; submitting is opt-in.
 - `ChatGPT Web → agent` starts only the user-configured local command. An empty

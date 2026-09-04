@@ -30,6 +30,41 @@ class TriggerTests(unittest.TestCase):
             store.finish("evt-1", "awaiting approval")
             self.assertEqual(store.event("evt-1")["status"], "awaiting approval")
 
+    def test_auto_mode_couples_approval_and_submit_and_drains_pending(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / "repo"; repo.mkdir()
+            config = {"handoff_repo": str(repo), "remote": "origin", "branch": "main", "repository": "owner/repo",
+                      "chatgpt": {}, "agent": {}}
+            store = trigger.Store(Path(directory) / "state.sqlite3")
+            service = trigger.Service(config, store)
+            event = {"event_key": "evt-pending", "sha": "a" * 40, "ref": "origin/feature", "pr_number": None,
+                     "origin": "agent", "caused_by": None, "subject": "pending", "observed_at": trigger.now(),
+                     "status": "awaiting approval"}
+            self.assertTrue(store.add_event(event))
+            calls = []
+            service.dispatch_event = lambda event_key: calls.append(event_key)
+
+            result = service.set_auto_mode(True)
+            self.assertTrue(result["auto_mode"])
+            self.assertEqual(result["drained_event_keys"], ["evt-pending"])
+            self.assertEqual(calls, ["evt-pending"])
+            self.assertFalse(store.setting("approval_required"))
+            self.assertTrue(store.setting("auto_submit"))
+
+            result = service.set_auto_mode(False)
+            self.assertFalse(result["auto_mode"])
+            self.assertTrue(store.setting("approval_required"))
+            self.assertFalse(store.setting("auto_submit"))
+
+    def test_pending_events_excludes_needs_human_failures(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = trigger.Store(Path(directory) / "state.sqlite3")
+            for key, status in (("await", "awaiting approval"), ("failed", "needs human")):
+                store.add_event({"event_key": key, "sha": key[0] * 40, "ref": "origin/feature", "pr_number": None,
+                                 "origin": "agent", "caused_by": None, "subject": key, "observed_at": trigger.now(),
+                                 "status": status})
+            self.assertEqual([event["event_key"] for event in store.pending_events()], ["await"])
+
     def test_wake_prompt_preserves_actual_event_id(self):
         with tempfile.TemporaryDirectory() as directory:
             repo = Path(directory) / "repo"; repo.mkdir()

@@ -128,7 +128,7 @@ PR 合并后，应从 HEAD 删除对应 `coordination/PR-<N>/`；过程历史由
 - 具体项目目标：在用户本机持续运行一个确定性触发器，通过 GitHub 将 Local Codex Agent 与固定的 ChatGPT Web 对话连接起来。
 - 真实任务 PR：无
 - 当前技术规范：见 `docs/技术规范.md`
-- 自动事件触发：由本机 Dashboard 控制；默认启用人工审批门，见 `coordination/coordination.yaml` 与 `trigger/README.md`
+- 自动事件触发：由本机 Dashboard 控制；默认启用人工审批门，另有明确的“自动审批模式”按钮可同时批准并发送，见 `coordination/coordination.yaml` 与 `trigger/README.md`
 
 本次行动的唯一首个可关闭目标、验收顺序、当前未决项和完成定义见
 [`docs/本次模拟交接任务.md`](docs/本次模拟交接任务.md)。后续 ChatGPT 或 Agent
