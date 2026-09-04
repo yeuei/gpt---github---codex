@@ -202,6 +202,31 @@ class OpenBrowserUse:
     def __init__(self, config: dict[str, Any]):
         self.chat = config["chatgpt"]
 
+    @staticmethod
+    def _result(raw: str, operation: str) -> Any:
+        """Extract a successful Open Browser Use JSON-RPC result."""
+        try:
+            payload = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(f"{operation} returned invalid JSON: {raw}") from exc
+        if payload.get("error"):
+            raise RuntimeError(f"{operation} failed: {payload['error'].get('message', payload['error'])}")
+        return payload.get("result")
+
+    def _cdp(self, common: list[str], tab_id: int, method: str, params: dict[str, Any]) -> Any:
+        raw = run(["open-browser-use", "cdp", *common, "--tab-id", str(tab_id), "--method", method,
+                   "--params", json.dumps(params)], timeout=20)
+        return self._result(raw, f"CDP {method}")
+
+    def _evaluate(self, common: list[str], tab_id: int, expression: str) -> Any:
+        result = self._cdp(common, tab_id, "Runtime.evaluate", {
+            "expression": expression, "returnByValue": True, "awaitPromise": True,
+        })
+        evaluated = result.get("result", {}) if isinstance(result, dict) else {}
+        if "exceptionDetails" in result:
+            raise RuntimeError(f"ChatGPT composer check failed: {result['exceptionDetails'].get('text', 'JavaScript exception')}")
+        return evaluated.get("value")
+
     def dispatch(self, message: str, submit: bool) -> str:
         url = self.chat.get("conversation_url", "")
         if "REPLACE_" in url or not url.startswith("https://chatgpt.com/"):
@@ -223,21 +248,35 @@ class OpenBrowserUse:
             if not numbers:
                 raise RuntimeError(f"could not read opened tab id: {opened}")
             tab_id = int(numbers[-1])
-        # Use Chrome CDP through OBU. This is a bounded, visible UI action;
-        # it does not inspect credentials or unrelated browsing data.
-        expression = """(() => { const e=document.querySelector('#prompt-textarea,[contenteditable=\"true\"]');
-          if (!e) throw new Error('ChatGPT composer not found'); e.focus();
-          if ('value' in e) { e.value=%s; } else { e.textContent=%s; }
-          e.dispatchEvent(new InputEvent('input',{bubbles:true,inputType:'insertText',data:%s})); return 'filled'; })()""" % tuple(json.dumps(message) for _ in range(3))
-        run(["open-browser-use", "cdp", *common, "--tab-id", str(tab_id), "--method", "Runtime.evaluate",
-             "--params", json.dumps({"expression": expression, "awaitPromise": True})], timeout=20)
-        if submit:
-            send = """(() => { const b=document.querySelector('[data-testid=\"send-button\"]');
-              if (!b || b.disabled) throw new Error('send button unavailable'); b.click(); return 'submitted'; })()"""
-            run(["open-browser-use", "cdp", *common, "--tab-id", str(tab_id), "--method", "Runtime.evaluate",
-                 "--params", json.dumps({"expression": send, "awaitPromise": True})], timeout=20)
-        run(["open-browser-use", "finalize-tabs", *common, "--keep", json.dumps([{"tabId": tab_id, "status": "handoff"}])], timeout=15)
-        return "submitted" if submit else "filled; waiting for user submit"
+        # ChatGPT uses a ProseMirror editor. Directly assigning textContent makes
+        # a visually plausible DOM change but does not update the app's draft.
+        # Focus the exact editor and use CDP's native text input instead.
+        editor = "#prompt-textarea[contenteditable=\\\"true\\\"]"
+        before = self._evaluate(common, tab_id, """(() => {
+          const e=document.querySelector(%s); if (!e) throw new Error('ChatGPT composer not found');
+          const text=(e.innerText||e.textContent||'').trim(); e.focus();
+          return {draftLength:text.length}; })()""" % json.dumps(editor))
+        if not isinstance(before, dict):
+            raise RuntimeError("could not read ChatGPT composer state")
+        if before.get("draftLength", 0):
+            raise RuntimeError("ChatGPT composer already contains a draft; refusing to overwrite it")
+        self._cdp(common, tab_id, "Input.insertText", {"text": message})
+        verified = self._evaluate(common, tab_id, """(() => {
+          const e=document.querySelector(%s); const actual=(e?.innerText||e?.textContent||'').trim();
+          return {length:actual.length, matches:actual===%s}; })()""" % (json.dumps(editor), json.dumps(message.strip())))
+        if not isinstance(verified, dict) or not verified.get("matches"):
+            raise RuntimeError("ChatGPT composer did not retain the injected handoff; no message was sent")
+        try:
+            if submit:
+                send = """(() => { const b=document.querySelector('[data-testid=\"send-button\"]');
+                  if (!b || b.disabled) throw new Error('send button unavailable'); b.click(); return 'submitted'; })()"""
+                self._evaluate(common, tab_id, send)
+                return "submitted"
+            return "filled; verified; waiting for user submit"
+        finally:
+            run(["open-browser-use", "finalize-tabs", *common,
+                 "--keep", json.dumps([{"tabId": tab_id, "status": "handoff"}])], timeout=15)
+            run(["open-browser-use", "turn-ended", *common], timeout=15)
 
 
 class Service:

@@ -50,6 +50,36 @@ class TriggerTests(unittest.TestCase):
             self.assertIn("PR: #unassigned", prompt)
             self.assertIn("创建真实 PR", prompt)
 
+    def test_browser_dispatch_uses_native_input_and_verifies_draft(self):
+        config = {"chatgpt": {"conversation_url": "https://chatgpt.com/c/test", "browser": "chrome", "profile": "Default"}}
+        adapter = trigger.OpenBrowserUse(config)
+        calls = []
+        original = trigger.run
+
+        def fake_run(command, cwd=None, timeout=30):
+            calls.append(command)
+            if command[:3] == ["open-browser-use", "call", "--session-id"]:
+                return '{"result":[{"id":42,"url":"https://chatgpt.com/c/test"}]}'
+            if "--method" in command:
+                method = command[command.index("--method") + 1]
+                if method == "Runtime.evaluate":
+                    params = command[command.index("--params") + 1]
+                    if "draftLength" in params:
+                        return '{"result":{"result":{"type":"object","value":{"draftLength":0}}}}'
+                    return '{"result":{"result":{"type":"object","value":{"length":12,"matches":true}}}}'
+                if method == "Input.insertText":
+                    return '{"result":{}}'
+            return '{}'
+
+        try:
+            trigger.run = fake_run
+            self.assertEqual(adapter.dispatch("handoff test", submit=False), "filled; verified; waiting for user submit")
+        finally:
+            trigger.run = original
+        methods = [call[call.index("--method") + 1] for call in calls if call[:2] == ["open-browser-use", "cdp"]]
+        self.assertEqual(methods, ["Runtime.evaluate", "Input.insertText", "Runtime.evaluate"])
+        self.assertTrue(any(call[:2] == ["open-browser-use", "turn-ended"] for call in calls))
+
 
 if __name__ == "__main__":
     unittest.main()
