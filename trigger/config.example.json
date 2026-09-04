@@ -10,6 +10,6 @@
     "profile": "Default"
   },
   "agent": {
-    "command": []
+    "command": ["/absolute/path/to/trigger/codex-agent-wrapper"]
   }
 }

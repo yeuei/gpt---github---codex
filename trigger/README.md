@@ -23,6 +23,10 @@ coordination trailers, and writes its audit trail to local SQLite—not Git.
   configured conversation URL. The default is fill-only; submitting is opt-in.
 - `ChatGPT Web → agent` starts only the user-configured local command. An empty
   command causes a visible `needs human` event rather than a surprise process.
+  This repository includes an optional `trigger/codex-agent-wrapper` example;
+  review it first, then set `agent.command` to its absolute path if you want
+  the reverse route to launch Codex CLI with `workspace-write` and normal
+  command approvals.
 - The first poll establishes a baseline; it never replays historical commits.
 - Every event is deduplicated by `Coordination-Event-Id`, or by commit SHA when
   a legacy commit lacks that trailer.
