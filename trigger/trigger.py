@@ -246,15 +246,18 @@ class Service:
         self.git, self.browser = GitSource(config), OpenBrowserUse(config)
         self.last_error = ""
 
-    def wake_prompt(self, commit: Commit, pr: int | None, event_id: str | None = None) -> str:
+    def wake_prompt(self, commit: Commit, pr: int | None, event_id: str | None = None, ref: str = "") -> str:
+        follow_up = ("本事件尚未关联 PR。请检查上述分支是否只包含一个可关闭目标；若是且你拥有写权限，"
+                     "创建真实 PR，并只在获得真实编号后从 TEMPLATE 实例化 coordination/PR-<N>/。"
+                     "不得虚构 PR 编号。" if pr is None else
+                     "请按 Coordinator 协议重新读取该 PR 的当前 HEAD、任务.md 和 agent汇报.md。")
         return ("GitHub 协作事件已到达。\n\n"
-                f"Repository: {self.config['repository']}\nPR: #{pr if pr else 'unknown'}\n"
+                f"Repository: {self.config['repository']}\nBranch: {ref or 'unknown'}\nPR: #{pr if pr else 'unassigned'}\n"
                 f"Origin: agent\nHead: {commit.sha}\nEvent-ID: {event_id or commit.event_id}\n\n"
-                "请按 Coordinator 协议重新读取该仓库当前 HEAD、相关 PR、任务.md 和 agent汇报.md。"
-                "本消息仅用于唤醒；不要依据本聊天中的旧状态猜测项目事实。")
+                f"{follow_up}\n本消息仅用于唤醒；不要依据本聊天中的旧状态猜测项目事实。")
 
     def wake_prompt_for_event(self, event: dict[str, Any]) -> str:
-        return self.wake_prompt(Commit(event["sha"], "", event["subject"]), event["pr_number"], event["event_key"])
+        return self.wake_prompt(Commit(event["sha"], "", event["subject"]), event["pr_number"], event["event_key"], event["ref"])
 
     def dispatch_agent(self, commit: Commit, pr: int | None) -> str:
         command = self.config["agent"].get("command", [])

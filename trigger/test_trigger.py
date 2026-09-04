@@ -36,8 +36,19 @@ class TriggerTests(unittest.TestCase):
             config = {"handoff_repo": str(repo), "remote": "origin", "branch": "main", "repository": "owner/repo",
                       "chatgpt": {}, "agent": {}}
             service = trigger.Service(config, trigger.Store(Path(directory) / "state.sqlite3"))
-            prompt = service.wake_prompt_for_event({"sha": "a" * 40, "subject": "update", "pr_number": 3, "event_key": "event-real"})
+            prompt = service.wake_prompt_for_event({"sha": "a" * 40, "subject": "update", "ref": "origin/feature", "pr_number": 3, "event_key": "event-real"})
             self.assertIn("Event-ID: event-real", prompt)
+            self.assertIn("Branch: origin/feature", prompt)
+
+    def test_unassigned_event_requests_real_pr_instead_of_inventing_one(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / "repo"; repo.mkdir()
+            config = {"handoff_repo": str(repo), "remote": "origin", "branch": "main", "repository": "owner/repo",
+                      "chatgpt": {}, "agent": {}}
+            service = trigger.Service(config, trigger.Store(Path(directory) / "state.sqlite3"))
+            prompt = service.wake_prompt_for_event({"sha": "b" * 40, "subject": "bootstrap", "ref": "origin/new-work", "pr_number": None, "event_key": "bootstrap-1"})
+            self.assertIn("PR: #unassigned", prompt)
+            self.assertIn("创建真实 PR", prompt)
 
 
 if __name__ == "__main__":
