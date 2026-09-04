@@ -266,10 +266,19 @@ class OpenBrowserUse:
         try:
             before = self._evaluate(common, tab_id, """(() => {
               const e=document.querySelector(%s); if (!e) throw new Error('ChatGPT composer not found');
-              const text=(e.innerText||e.textContent||'').trim(); e.focus();
-              return {draftLength:text.length}; })()""" % json.dumps(editor))
+              const fallback=document.querySelector('textarea[placeholder="问问 ChatGPT"], textarea.wcDTda_fallbackTextarea');
+              const text=(e.innerText||e.textContent||fallback?.value||'').trim(); e.focus();
+              return {draftLength:text.length, draftText:text}; })()""" % json.dumps(editor))
             if not isinstance(before, dict):
                 raise RuntimeError("could not read ChatGPT composer state")
+            if before.get("draftText") == message.strip():
+                handoff_ready = not submit
+                if submit:
+                    send = """(() => { const b=document.querySelector('[data-testid=\"send-button\"]');
+                      if (!b || b.disabled) throw new Error('send button unavailable'); b.click(); return 'submitted'; })()"""
+                    self._evaluate(common, tab_id, send)
+                    return "submitted"
+                return "filled; verified; waiting for user submit"
             if before.get("draftLength", 0):
                 raise RuntimeError("ChatGPT composer already contains a draft; refusing to overwrite it")
             inserted = self._evaluate(common, tab_id, """(() => {
@@ -277,9 +286,23 @@ class OpenBrowserUse:
               return {inserted:document.execCommand('insertText', false, %s)}; })()""" % (json.dumps(editor), json.dumps(message)))
             if not isinstance(inserted, dict) or not inserted.get("inserted"):
                 raise RuntimeError("browser refused to insert the ChatGPT handoff draft")
-            verified = self._evaluate(common, tab_id, """(() => {
-              const e=document.querySelector(%s); const actual=(e?.innerText||e?.textContent||'').trim();
-              return {length:actual.length, matches:actual===%s}; })()""" % (json.dumps(editor), json.dumps(message.strip())))
+            verified = self._evaluate(common, tab_id, """(async () => {
+              const expected=%s; const deadline=Date.now()+2500;
+              while (Date.now() < deadline) {
+                const e=document.querySelector(%s);
+                const fallback=document.querySelector('textarea[placeholder="问问 ChatGPT"], textarea.wcDTda_fallbackTextarea');
+                const actuals=[e?.innerText,e?.textContent,fallback?.value]
+                  .filter(value => typeof value === 'string').map(value => value.trim());
+                const actual=actuals.find(value => value === expected) || actuals.find(Boolean) || '';
+                if (actual === expected) return {length:actual.length, matches:true};
+                await new Promise(resolve => setTimeout(resolve, 100));
+              }
+              const e=document.querySelector(%s);
+              const fallback=document.querySelector('textarea[placeholder="问问 ChatGPT"], textarea.wcDTda_fallbackTextarea');
+              const actuals=[e?.innerText,e?.textContent,fallback?.value]
+                .filter(value => typeof value === 'string').map(value => value.trim());
+              return {length:Math.max(0,...actuals.map(value => value.length)), matches:false};
+            })()""" % (json.dumps(message.strip()), json.dumps(editor), json.dumps(editor)))
             if not isinstance(verified, dict) or not verified.get("matches"):
                 raise RuntimeError("ChatGPT composer did not retain the injected handoff; no message was sent")
             handoff_ready = not submit
