@@ -3,6 +3,9 @@ schema_version: coordination.v2
 project:
   project_id: "gpt---github---codex"
   repository: "yeuei/gpt---github---codex"
+  intent_document: "docs/本次模拟交接任务.md"
+  current_goal: "完成本地触发器 V1 的审批式双向模拟交接"
+  completion_requires_real_pr: true
 
 clients:
   chatgpt:
@@ -50,6 +53,9 @@ local_trigger:
   chatgpt_mode: "web_chat"
   configuration_file: "trigger/config.local.json"
   configuration_is_gitignored: true
+  browser_health_endpoint: "/api/browser/check"
+  browser_health_ui: "检测浏览器连接"
+  reconnect_policy: "long_lived_session_then_stale_registry_cleanup_and_retry"
 
 origin_values:
   - agent

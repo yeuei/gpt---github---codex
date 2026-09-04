@@ -130,6 +130,10 @@ PR 合并后，应从 HEAD 删除对应 `coordination/PR-<N>/`；过程历史由
 - 当前技术规范：见 `docs/技术规范.md`
 - 自动事件触发：由本机 Dashboard 控制；默认启用人工审批门，见 `coordination/coordination.yaml` 与 `trigger/README.md`
 
+本次行动的唯一首个可关闭目标、验收顺序、当前未决项和完成定义见
+[`docs/本次模拟交接任务.md`](docs/本次模拟交接任务.md)。后续 ChatGPT 或 Agent
+进入本仓库时，必须先读该文件，再根据真实 PR 状态继续；不得把历史提交数量或旧聊天当作任务完成证据。
+
 本次 V1 的验收范围：
 
 1. 本地守护程序从 GitHub commit trailer 识别事件、去重并记录时间线；
