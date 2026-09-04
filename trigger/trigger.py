@@ -326,7 +326,13 @@ class OpenBrowserUse:
               return {draftLength:text.length, draftText:text}; })()""" % json.dumps(editor))
             if not isinstance(before, dict):
                 raise RuntimeError("could not read ChatGPT composer state")
-            if before.get("draftText") == message.strip():
+            # ProseMirror's innerText includes extra blank lines between <p>
+            # nodes; normalize only layout whitespace before comparing content.
+            normalize = lambda value: re.sub(r"\n{3,}", "\n\n", re.sub(r"[ \t]+\n", "\n", value.replace("\r", ""))).strip()
+            existing_draft = normalize(str(before.get("draftText", "")))
+            event_match = re.search(r"(?:^|\n)Event-ID:\s*(\S+)", message)
+            same_event = bool(event_match and event_match.group(1) in existing_draft)
+            if existing_draft == normalize(message) or same_event:
                 handoff_ready = not submit
                 if submit:
                     send = """(() => { const b=document.querySelector('[data-testid=\"send-button\"]');
@@ -342,12 +348,13 @@ class OpenBrowserUse:
             if not isinstance(inserted, dict) or not inserted.get("inserted"):
                 raise RuntimeError("browser refused to insert the ChatGPT handoff draft")
             verified = self._evaluate(common, tab_id, """(async () => {
-              const expected=%s; const deadline=Date.now()+2500;
+              const normalize=value => value.replace(/\r/g,'').replace(/[ \t]+\n/g,'\n').replace(/\n{3,}/g,'\n\n').trim();
+              const expected=normalize(%s); const deadline=Date.now()+2500;
               while (Date.now() < deadline) {
                 const e=document.querySelector(%s);
                 const fallback=document.querySelector('textarea[placeholder="问问 ChatGPT"], textarea.wcDTda_fallbackTextarea');
                 const actuals=[e?.innerText,e?.textContent,fallback?.value]
-                  .filter(value => typeof value === 'string').map(value => value.trim());
+                  .filter(value => typeof value === 'string').map(normalize);
                 const actual=actuals.find(value => value === expected) || actuals.find(Boolean) || '';
                 if (actual === expected) return {length:actual.length, matches:true};
                 await new Promise(resolve => setTimeout(resolve, 100));
@@ -355,7 +362,7 @@ class OpenBrowserUse:
               const e=document.querySelector(%s);
               const fallback=document.querySelector('textarea[placeholder="问问 ChatGPT"], textarea.wcDTda_fallbackTextarea');
               const actuals=[e?.innerText,e?.textContent,fallback?.value]
-                .filter(value => typeof value === 'string').map(value => value.trim());
+                .filter(value => typeof value === 'string').map(normalize);
               return {length:Math.max(0,...actuals.map(value => value.length)), matches:false};
             })()""" % (json.dumps(message.strip()), json.dumps(editor), json.dumps(editor)))
             if not isinstance(verified, dict) or not verified.get("matches"):
