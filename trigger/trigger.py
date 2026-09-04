@@ -8,6 +8,7 @@ is opt-in and disabled by default; the dashboard controls both directions.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import re
 import shlex
@@ -15,7 +16,6 @@ import sqlite3
 import subprocess
 import threading
 import time
-import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from http import HTTPStatus
@@ -227,7 +227,9 @@ class OpenBrowserUse:
         # Keep one broker session for the lifetime of the local trigger. Ending
         # the OBU turn after every event can leave active.json pointing at a
         # broker that has already exited, making the next event look offline.
-        self.session_id = f"obu-trigger-{uuid.uuid4().hex[:12]}"
+        session_seed = "|".join((self.chat.get(key, "") for key in ("browser", "profile", "conversation_url")))
+        session_hash = hashlib.sha256(session_seed.encode()).hexdigest()[:12]
+        self.session_id = f"obu-trigger-{session_hash}"
         self._health_lock = threading.Lock()
 
     def _common(self) -> list[str]:
@@ -327,7 +329,14 @@ class OpenBrowserUse:
         matching = [tab for tab in tabs if tab.get("url") == url]
         if matching:
             tab_id = matching[-1]["id"]
-            self._rpc(["open-browser-use", "claim-tab", *common, "--tab-id", str(tab_id)], "claim ChatGPT tab")
+            try:
+                self._rpc(["open-browser-use", "claim-tab", *common, "--tab-id", str(tab_id)], "claim ChatGPT tab")
+            except RuntimeError as exc:
+                # A daemon restart reuses this deterministic session id. OBU
+                # reports the tab as already owned by that same session; this
+                # is safe to continue with and avoids an orphaned handoff.
+                if f"already part of browser session {self.session_id}" not in str(exc):
+                    raise
         else:
             opened = self._rpc(["open-browser-use", "open-tab", *common, "--url", url], "open ChatGPT tab")
             candidate = opened.get("tabId") if isinstance(opened, dict) else None

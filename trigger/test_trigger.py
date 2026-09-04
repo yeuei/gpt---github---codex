@@ -95,6 +95,8 @@ class TriggerTests(unittest.TestCase):
             calls.append(command)
             if command[:3] == ["open-browser-use", "call", "--session-id"]:
                 return '{"result":[{"id":42,"url":"https://chatgpt.com/c/test"}]}'
+            if command[:2] == ["open-browser-use", "claim-tab"]:
+                return '{"error":{"message":"Tab 42 is already part of browser session %s"}}' % adapter.session_id
             if "--method" in command:
                 method = command[command.index("--method") + 1]
                 if method == "Runtime.evaluate":
@@ -116,6 +118,14 @@ class TriggerTests(unittest.TestCase):
         methods = [call[call.index("--method") + 1] for call in calls if call[:2] == ["open-browser-use", "cdp"]]
         self.assertEqual(methods, ["Runtime.evaluate", "Runtime.evaluate", "Runtime.evaluate"])
         self.assertTrue(any(call[:2] == ["open-browser-use", "finalize-tabs"] for call in calls))
+
+    def test_browser_session_id_is_stable_for_same_target(self):
+        config = {"chatgpt": {"conversation_url": "https://chatgpt.com/c/test", "browser": "chrome", "profile": "Default"}}
+        first = trigger.OpenBrowserUse(config)
+        second = trigger.OpenBrowserUse(config)
+        self.assertEqual(first.session_id, second.session_id)
+        changed = trigger.OpenBrowserUse({"chatgpt": {"conversation_url": "https://chatgpt.com/c/test", "browser": "chrome", "profile": "Other"}})
+        self.assertNotEqual(first.session_id, changed.session_id)
 
     def test_browser_health_reports_connected_target(self):
         config = {"chatgpt": {"conversation_url": "https://chatgpt.com/c/test", "browser": "chrome", "profile": "Default"}}
