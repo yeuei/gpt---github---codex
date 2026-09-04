@@ -49,9 +49,11 @@ def load_config(path: Path) -> dict[str, Any]:
         example = ROOT / "config.example.json"
         raise RuntimeError(f"missing {path}; copy {example.name} and configure it")
     config = json.loads(path.read_text())
-    for key in ("handoff_repo", "remote", "branch", "repository", "chatgpt", "agent"):
+    for key in ("handoff_repo", "remote", "repository", "chatgpt", "agent"):
         if key not in config:
             raise RuntimeError(f"config missing {key}")
+    if "watch_branches" not in config:
+        config["watch_branches"] = "all"
     return config
 
 
@@ -66,11 +68,15 @@ class Store:
               create table if not exists cursors (key text primary key, value text not null);
               create table if not exists events (
                 id integer primary key, event_key text unique not null, sha text not null,
-                pr_number integer, origin text, caused_by text, subject text not null,
+                ref text not null default '', pr_number integer, origin text, caused_by text, subject text not null,
                 observed_at text not null, dispatched_at text, status text not null,
                 detail text not null default ''
               );
             """)
+            try:
+                self.db.execute("alter table events add column ref text not null default ''")
+            except sqlite3.OperationalError:
+                pass
             defaults = {"enabled": True, "agent_to_chatgpt": True,
                         "chatgpt_to_agent": True, "auto_submit": False,
                         "approval_required": True}
@@ -89,21 +95,21 @@ class Store:
                             (key, json.dumps(value)))
             self.db.commit()
 
-    def cursor(self) -> str | None:
+    def cursor(self, ref: str) -> str | None:
         with self.lock:
-            row = self.db.execute("select value from cursors where key='git_head'").fetchone()
+            row = self.db.execute("select value from cursors where key=?", (f"git_head:{ref}",)).fetchone()
         return row["value"] if row else None
 
-    def set_cursor(self, sha: str) -> None:
+    def set_cursor(self, ref: str, sha: str) -> None:
         with self.lock:
-            self.db.execute("insert into cursors values ('git_head', ?) on conflict(key) do update set value=excluded.value", (sha,))
+            self.db.execute("insert into cursors values (?, ?) on conflict(key) do update set value=excluded.value", (f"git_head:{ref}", sha))
             self.db.commit()
 
     def add_event(self, event: dict[str, Any]) -> bool:
         with self.lock:
             try:
-                self.db.execute("""insert into events(event_key,sha,pr_number,origin,caused_by,subject,observed_at,status)
-                  values(:event_key,:sha,:pr_number,:origin,:caused_by,:subject,:observed_at,:status)""", event)
+                self.db.execute("""insert into events(event_key,sha,ref,pr_number,origin,caused_by,subject,observed_at,status)
+                  values(:event_key,:sha,:ref,:pr_number,:origin,:caused_by,:subject,:observed_at,:status)""", event)
                 self.db.commit()
                 return True
             except sqlite3.IntegrityError:
@@ -157,11 +163,18 @@ class GitSource:
     def __init__(self, config: dict[str, Any]):
         self.repo = (ROOT / config["handoff_repo"]).resolve()
         self.remote = config["remote"]
-        self.branch = config["branch"]
+        self.watch_branches = config.get("watch_branches", "all")
 
-    def poll(self, cursor: str | None) -> tuple[str, list[Commit]]:
-        run(["git", "fetch", self.remote, self.branch, "--quiet"], self.repo)
-        head = run(["git", "rev-parse", f"{self.remote}/{self.branch}"], self.repo)
+    def refs(self) -> list[str]:
+        names = run(["git", "for-each-ref", "--format=%(refname:short)", f"refs/remotes/{self.remote}"], self.repo).splitlines()
+        refs = [name for name in names if name not in {self.remote, f"{self.remote}/HEAD"}]
+        if self.watch_branches == "all":
+            return refs
+        wanted = set(self.watch_branches)
+        return [name for name in refs if name.removeprefix(f"{self.remote}/") in wanted]
+
+    def poll(self, ref: str, cursor: str | None) -> tuple[str, list[Commit]]:
+        head = run(["git", "rev-parse", ref], self.repo)
         if cursor is None:
             return head, []  # First start establishes a safe baseline.
         if cursor == head:
@@ -252,11 +265,11 @@ class Service:
         subprocess.Popen([*command, prompt], cwd=self.git.repo, start_new_session=True)
         return "local agent process started"
 
-    def handle(self, commit: Commit) -> None:
+    def handle(self, commit: Commit, ref: str) -> None:
         if commit.origin not in {"agent", "chatgpt"}:
             return
         pr = self.git.pr_number(commit.sha)
-        event = {"event_key": commit.event_id, "sha": commit.sha, "pr_number": pr,
+        event = {"event_key": commit.event_id, "sha": commit.sha, "ref": ref, "pr_number": pr,
                  "origin": commit.origin, "caused_by": commit.caused_by, "subject": commit.subject,
                  "observed_at": now(), "status": "detected"}
         if not self.store.add_event(event):
@@ -291,12 +304,16 @@ class Service:
 
     def poll_once(self) -> dict[str, Any]:
         try:
-            head, commits = self.git.poll(self.store.cursor())
-            for commit in commits:
-                self.handle(commit)
-            self.store.set_cursor(head)
+            run(["git", "fetch", self.git.remote, "--prune", "--quiet"], self.git.repo)
+            observed = []
+            for ref in self.git.refs():
+                head, commits = self.git.poll(ref, self.store.cursor(ref))
+                for commit in commits:
+                    self.handle(commit, ref)
+                self.store.set_cursor(ref, head)
+                observed.append({"ref": ref, "commits": len(commits), "head": head})
             self.last_error = ""
-            return {"head": head, "commits": len(commits)}
+            return {"refs": observed, "commits": sum(item["commits"] for item in observed)}
         except Exception as exc:
             self.last_error = str(exc)
             return {"error": self.last_error}

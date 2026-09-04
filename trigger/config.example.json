@@ -1,7 +1,7 @@
 {
   "handoff_repo": "..",
   "remote": "origin",
-  "branch": "main",
+  "watch_branches": "all",
   "repository": "yeuei/gpt---github---codex",
   "poll_interval_seconds": 15,
   "chatgpt": {

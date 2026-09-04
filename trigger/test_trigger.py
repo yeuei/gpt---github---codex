@@ -22,7 +22,7 @@ class TriggerTests(unittest.TestCase):
     def test_store_deduplicates_and_defaults_to_approval(self):
         with tempfile.TemporaryDirectory() as directory:
             store = trigger.Store(Path(directory) / "state.sqlite3")
-            event = {"event_key": "evt-1", "sha": "a" * 40, "pr_number": 7, "origin": "agent",
+            event = {"event_key": "evt-1", "sha": "a" * 40, "ref": "origin/feature", "pr_number": 7, "origin": "agent",
                      "caused_by": None, "subject": "test", "observed_at": trigger.now(), "status": "detected"}
             self.assertTrue(store.add_event(event))
             self.assertFalse(store.add_event(event))
