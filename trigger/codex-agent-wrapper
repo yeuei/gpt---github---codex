@@ -6,8 +6,9 @@ set -euo pipefail
 # command approval policy visible; do not use a bypass flag here.
 repo_dir="$(cd "$(dirname "$0")/.." && pwd)"
 codex_bin="${CODEX_BIN:-$(command -v codex)}"
-exec "$codex_bin" exec \
+exec "$codex_bin" \
+  --ask-for-approval on-request \
+  exec \
   --cd "$repo_dir" \
   --sandbox workspace-write \
-  --ask-for-approval on-request \
   "$@"
