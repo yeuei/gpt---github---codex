@@ -80,6 +80,13 @@ class TriggerTests(unittest.TestCase):
         self.assertEqual(methods, ["Runtime.evaluate", "Input.insertText", "Runtime.evaluate"])
         self.assertTrue(any(call[:2] == ["open-browser-use", "turn-ended"] for call in calls))
 
+    def test_browser_rpc_errors_are_not_treated_as_success(self):
+        with self.assertRaisesRegex(RuntimeError, "already part of browser session"):
+            trigger.OpenBrowserUse._result(
+                '{"error":{"code":-32000,"message":"Tab 42 is already part of browser session old"}}',
+                "claim ChatGPT tab",
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

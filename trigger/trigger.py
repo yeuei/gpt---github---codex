@@ -218,6 +218,9 @@ class OpenBrowserUse:
                    "--params", json.dumps(params)], timeout=20)
         return self._result(raw, f"CDP {method}")
 
+    def _rpc(self, command: list[str], operation: str, timeout: int = 15) -> Any:
+        return self._result(run(command, timeout=timeout), operation)
+
     def _evaluate(self, common: list[str], tab_id: int, expression: str) -> Any:
         result = self._cdp(common, tab_id, "Runtime.evaluate", {
             "expression": expression, "returnByValue": True, "awaitPromise": True,
@@ -236,37 +239,46 @@ class OpenBrowserUse:
                   "--profile", self.chat.get("profile", "Default")]
         # This tests that the explicitly configured browser/profile is connected.
         run(["open-browser-use", "ping", *common], timeout=15)
-        tabs_raw = run(["open-browser-use", "call", *common, "--method", "getUserTabs", "--params", "{}"], timeout=15)
-        tabs = json.loads(tabs_raw).get("tabs", json.loads(tabs_raw).get("result", []))
+        tabs_result = self._rpc(
+            ["open-browser-use", "call", *common, "--method", "getUserTabs", "--params", "{}"],
+            "getUserTabs",
+        )
+        tabs = tabs_result.get("tabs", []) if isinstance(tabs_result, dict) else tabs_result
+        if not isinstance(tabs, list):
+            raise RuntimeError("getUserTabs returned an invalid tab list")
         matching = [tab for tab in tabs if tab.get("url") == url]
         if matching:
             tab_id = matching[-1]["id"]
-            run(["open-browser-use", "claim-tab", *common, "--tab-id", str(tab_id)], timeout=15)
+            self._rpc(["open-browser-use", "claim-tab", *common, "--tab-id", str(tab_id)], "claim ChatGPT tab")
         else:
-            opened = run(["open-browser-use", "open-tab", *common, "--url", url], timeout=15)
-            numbers = re.findall(r"\d+", opened)
-            if not numbers:
+            opened = self._rpc(["open-browser-use", "open-tab", *common, "--url", url], "open ChatGPT tab")
+            candidate = opened.get("tabId") if isinstance(opened, dict) else None
+            if candidate is None and isinstance(opened, dict):
+                candidate = opened.get("tab", {}).get("id")
+            if not isinstance(candidate, int):
                 raise RuntimeError(f"could not read opened tab id: {opened}")
-            tab_id = int(numbers[-1])
+            tab_id = candidate
         # ChatGPT uses a ProseMirror editor. Directly assigning textContent makes
         # a visually plausible DOM change but does not update the app's draft.
         # Focus the exact editor and use CDP's native text input instead.
         editor = "#prompt-textarea[contenteditable=\\\"true\\\"]"
-        before = self._evaluate(common, tab_id, """(() => {
-          const e=document.querySelector(%s); if (!e) throw new Error('ChatGPT composer not found');
-          const text=(e.innerText||e.textContent||'').trim(); e.focus();
-          return {draftLength:text.length}; })()""" % json.dumps(editor))
-        if not isinstance(before, dict):
-            raise RuntimeError("could not read ChatGPT composer state")
-        if before.get("draftLength", 0):
-            raise RuntimeError("ChatGPT composer already contains a draft; refusing to overwrite it")
-        self._cdp(common, tab_id, "Input.insertText", {"text": message})
-        verified = self._evaluate(common, tab_id, """(() => {
-          const e=document.querySelector(%s); const actual=(e?.innerText||e?.textContent||'').trim();
-          return {length:actual.length, matches:actual===%s}; })()""" % (json.dumps(editor), json.dumps(message.strip())))
-        if not isinstance(verified, dict) or not verified.get("matches"):
-            raise RuntimeError("ChatGPT composer did not retain the injected handoff; no message was sent")
+        handoff_ready = False
         try:
+            before = self._evaluate(common, tab_id, """(() => {
+              const e=document.querySelector(%s); if (!e) throw new Error('ChatGPT composer not found');
+              const text=(e.innerText||e.textContent||'').trim(); e.focus();
+              return {draftLength:text.length}; })()""" % json.dumps(editor))
+            if not isinstance(before, dict):
+                raise RuntimeError("could not read ChatGPT composer state")
+            if before.get("draftLength", 0):
+                raise RuntimeError("ChatGPT composer already contains a draft; refusing to overwrite it")
+            self._cdp(common, tab_id, "Input.insertText", {"text": message})
+            verified = self._evaluate(common, tab_id, """(() => {
+              const e=document.querySelector(%s); const actual=(e?.innerText||e?.textContent||'').trim();
+              return {length:actual.length, matches:actual===%s}; })()""" % (json.dumps(editor), json.dumps(message.strip())))
+            if not isinstance(verified, dict) or not verified.get("matches"):
+                raise RuntimeError("ChatGPT composer did not retain the injected handoff; no message was sent")
+            handoff_ready = not submit
             if submit:
                 send = """(() => { const b=document.querySelector('[data-testid=\"send-button\"]');
                   if (!b || b.disabled) throw new Error('send button unavailable'); b.click(); return 'submitted'; })()"""
@@ -274,8 +286,11 @@ class OpenBrowserUse:
                 return "submitted"
             return "filled; verified; waiting for user submit"
         finally:
+            # A verified fill awaits the user's Send click, so retain handoff
+            # ownership.  Any failure before that point must be reclaimable.
+            status = "handoff" if handoff_ready else "deliverable"
             run(["open-browser-use", "finalize-tabs", *common,
-                 "--keep", json.dumps([{"tabId": tab_id, "status": "handoff"}])], timeout=15)
+                 "--keep", json.dumps([{"tabId": tab_id, "status": status}])], timeout=15)
             run(["open-browser-use", "turn-ended", *common], timeout=15)
 
 
