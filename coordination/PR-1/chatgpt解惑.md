@@ -4,74 +4,80 @@
 
 - PR: `#1`
 - branch: `feature/local-trigger-v1`
-- PR 创建时 head SHA: `19a9eef11a10429e903aacc10a0c42d9d88a042e`
-- 唤醒事件: `ggc-pr-bootstrap-001`
-- 事件消息携带的旧 head: `c9a7efafd21e779f701eeb6a8930ad73987268c5`
-- 当前任务真源: `docs/本次模拟交接任务.md`
+- 当前 GitHub head: `70c6241c21f68852345a7fffa03720c4a9414639`
+- 当前 Agent 汇报事件: `ggc-pr-1-agent-report-001`
+- 该事件由 `ggc-pr-1-bootstrap-chatgpt-001` 引起
+- 当前任务真源: `coordination/PR-1/任务.md`
+- 当前 Agent 现实快照: `coordination/PR-1/agent汇报.md`
 - 当前技术真源: `docs/技术规范.md`
 
 ## 当前问题
 
-Agent-origin bootstrap 事件到达时尚未分配真实 PR。需要核验 `feature/local-trigger-v1` 是否只包含一个可关闭目标；若是，则创建真实 PR，并仅在获得真实编号后实例化 coordination 三文件。
+事件消息仍写 `PR: #unassigned`，但 GitHub 当前事实显示 `feature/local-trigger-v1` 已经属于真实开放 PR #1。本轮真正需要处理的不是再次创建 PR，而是 Agent 在真实反向链路中已经捕获 ChatGPT-origin 事件，但由于本地 `trigger/config.local.json` 的 `agent.command` 为空，按协议进入 `needs human`。
 
 ## 结论
 
-已直接解决：
+本轮采用 **C. 请求用户做最小化决策**。
 
-1. 事件只作为唤醒使用，没有把事件中的旧 SHA 当作当前项目状态；
-2. 当前远端分支已从事件所带的 `c9a7...` 推进到 PR 创建时的 `19a9eef...`；
-3. 对比 `main` 并读取当前任务说明、触发器 README 与技术规范后，确认该分支围绕单一可关闭目标：**完成 Local Trigger V1 的审批式 GitHub ↔ ChatGPT Web 双向模拟交接并留下可复现证据**；
-4. 已据此创建真实 **PR #1**；
-5. 仅在获得真实编号后实例化 `coordination/PR-1/`。
+1. 不创建第二个 PR；现有真实 PR 是 **#1**。
+2. 不重新实例化 coordination 三文件；`coordination/PR-1/` 已存在且由 Agent 正式接管。
+3. T1.1、T1.2、T1.3、T1.5 已有 Agent 真实证据标记完成；T1.6 继续汇总验收。
+4. T1.4 当前唯一阻塞点是：用户尚未明确配置要由触发器启动的本地 Agent 命令。
+5. `agent.command` 不能由 ChatGPT 或 Agent 猜测，因为当前技术规范明确要求空命令时不得启动任何本地 Agent 进程。
 
 ## 依据
 
 ### 项目内事实
 
-- 分支相对 `main` 只前进、不落后；主要改动集中于 `trigger/`、触发器技术规范与本次模拟交接任务。
-- `docs/本次模拟交接任务.md` 明确给出唯一“首个可关闭目标”。
-- `docs/技术规范.md` 把当前技术真源定义为本地触发器 V1。
+- GitHub 当前 PR #1 的 head 是 `70c6241c21f68852345a7fffa03720c4a9414639`。
+- 该 commit 的 `Coordination-Event-Id` 是 `ggc-pr-1-agent-report-001`，来源为 Agent。
+- 当前 `任务.md` 将 T1.4 标为 `[?] WAITING_USER`，其余主要链路任务已完成或正在汇总。
+- 当前 `agent汇报.md` 记录：反向事件已经被 Trigger 捕获，状态为 `needs human`；原因仅为 `agent.command` 为空。
+- `trigger/config.example.json` 规定 `agent.command` 的类型是命令参数数组，默认值为 `[]`。
 
 ### ChatGPT 判断
 
-上述代码、Dashboard、协议更新、问题记录与双向运行证据都直接服务同一个 Local Trigger V1 闭环，不需要拆成第二个 PR。
+这不是研究/产品口径选择，也不是普通可自行猜测的工程细节，而是一个会在用户本机实际启动进程的明确授权项。因此必须由用户提供具体命令；在此之前继续保持 T1.4 `WAITING_USER` 是正确状态。
 
 ## Agent 已获得的权限
 
-以下普通工程问题由 Agent 自行决定，无需继续等待 ChatGPT/用户：
+在不改变当前安全语义的前提下，Agent 可以继续自行处理：
 
-- 本地路径、SQLite 工程结构、日志、有限重试、resume、错误裁剪；
+- 本地路径、日志、SQLite、有限重试、恢复和错误裁剪；
 - 普通 bug 修复；
-- 在不改变冻结安全语义的情况下优化 polling、连接复用和 Dashboard 实现；
-- 运行证据与本地审计记录的工程组织方式。
+- polling、OBU session 复用与 Dashboard 实现优化；
+- T1.6 中不依赖实际 Agent 启动的证据汇总。
 
-不得自行改变的当前安全语义包括：
+用户给出命令后，Agent 可以：
 
-- 默认逐条审批；
-- 默认不自动发送 ChatGPT 消息；
-- 首次 poll 不重放历史；
-- `agent.command` 为空时不启动也不猜测命令；
-- 不读取浏览器 cookie、密码、token 或无关标签页。
+- 将该命令写入本机 gitignored 的 `trigger/config.local.json`；
+- 按现有审批/自动审批规则重试同一反向事件；
+- 不创建重复 event id；
+- 完成实际 `ChatGPT → Agent` 启动证据后更新 T1.4 与 T1.6 状态。
 
 ## 立即执行
 
-1. Agent fetch/pull `feature/local-trigger-v1` 最新远端状态，读取 `coordination/PR-1/任务.md` 与本文件。
-2. Agent 用本地真实状态完整覆盖 `agent汇报.md`，并据真实证据修改 `任务.md` 状态；不要因 ChatGPT 创建文件就自动把运行任务标 DONE。
-3. 将本次 ChatGPT-origin coordination commit 作为反向唤醒事件处理并记录到 Dashboard/SQLite。
-4. 如果 `agent.command` 仍为空，反向事件必须进入可见的 `needs human`，不得猜测命令；这只阻塞真正启动 Agent 的那一步，不阻塞其它独立核验。
-5. 用户明确配置本地 Agent 命令后，按当前审批规则完成 ChatGPT → Agent 真实反向链路并保存证据。
-6. 不新增与当前闭环无关的 smoke、benchmark 或第二套协议。
+1. 不创建新 PR，不创建新的 `coordination/PR-N/`。
+2. 保持 T1.4 为 `[?] WAITING_USER`，不要把 `needs human` 误写为失败或 DONE。
+3. 继续不依赖 `agent.command` 的 T1.6 核验工作。
+4. 等待用户给出明确 `agent.command` 后，再完成实际反向启动。
 
 ## 不需要做
 
-- 不需要重新创建 PR；
-- 不需要为旧事件 SHA 回退分支；
-- 不需要预建其它 PR 目录；
-- 不需要把普通工程细节升级为用户决策；
-- 不需要为了本次 coordination 再拆成三个独立 commit。
+- 不需要重新跑 bootstrap；
+- 不需要根据事件中的 `#unassigned` 创建 PR #2；
+- 不需要回退到旧 head；
+- 不需要新增 smoke、benchmark 或第二套触发协议；
+- 不需要把浏览器凭据、cookie、token 或本地配置提交到 GitHub。
 
 ## 需要用户决定
 
-无核心项目口径决策。
+只需要一个最小输入：**触发器应该执行的本地 Agent 命令。**
 
-反向真正启动本地 Agent 前，如果 `agent.command` 仍为空，需要用户在本地配置一个明确命令；Agent 不得自行猜测。
+请用户提供完整 argv，建议直接按 JSON 数组形式给出，例如：
+
+```json
+["/绝对路径/to/agent-wrapper", "参数1", "参数2"]
+```
+
+如果希望直接启动 Codex CLI，也请给出你希望使用的完整命令及参数；ChatGPT 和 Agent 都不会自行猜测。
