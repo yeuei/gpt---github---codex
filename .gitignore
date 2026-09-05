@@ -1,0 +1,6 @@
+# Local trigger configuration and state can contain a user-specific chat URL,
+# browser profile name, and local command paths.  Never commit them.
+trigger/config.local.json
+trigger/state.sqlite3
+trigger/__pycache__/
+trigger/approval-requests/

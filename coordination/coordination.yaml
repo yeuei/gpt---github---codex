@@ -1,8 +1,11 @@
-schema_version: coordination.v1
+schema_version: coordination.v2
 
 project:
   project_id: "gpt---github---codex"
   repository: "yeuei/gpt---github---codex"
+  intent_document: "docs/本次模拟交接任务.md"
+  current_goal: "完成本地触发器 V1 的审批式双向模拟交接"
+  completion_requires_real_pr: true
 
 clients:
   chatgpt:
@@ -13,7 +16,7 @@ clients:
     role: "local_executor"
 
 event_protocol:
-  enabled: false
+  enabled: true
   required_fields:
     - event_id
     - repository
@@ -39,6 +42,24 @@ routing:
     suppress:
       - chatgpt
 
+local_trigger:
+  implementation: "trigger/trigger.py"
+  dashboard_bind: "127.0.0.1"
+  dashboard_port: 8765
+  default_poll_interval_seconds: 15
+  default_approval_required: true
+  default_auto_submit: false
+  auto_mode_ui: "自动审批模式"
+  auto_mode_default: false
+  auto_mode_endpoint: "/api/mode"
+  browser_adapter: "open-browser-use"
+  chatgpt_mode: "web_chat"
+  configuration_file: "trigger/config.local.json"
+  configuration_is_gitignored: true
+  browser_health_endpoint: "/api/browser/check"
+  browser_health_ui: "检测浏览器连接"
+  reconnect_policy: "long_lived_session_then_stale_registry_cleanup_and_retry"
+
 origin_values:
   - agent
   - chatgpt
@@ -52,6 +73,35 @@ deduplication:
     - pr_number
     - head_sha
     - origin
+
+binding:
+  enabled: true
+  schema_version: binding.v1
+  states: [pending, claimed, active, expired, revoked, conflict]
+  target_key: [repository, branch, pr_number]
+  required_fields:
+    - binding_id
+    - route_id
+    - repository
+    - branch
+    - pr_number
+    - web_conversation_id
+    - local_agent_id
+    - local_conversation_id
+    - created_at
+    - expires_at
+    - updated_at
+  token_policy: short_lived_single_use_hash_only
+  active_binding_limit: one_per_repository_branch_pr
+  title_policy: display_only_never_a_route_key
+  endpoints:
+    read: /api/bindings
+    invite: /api/bindings/invite
+    claim: /api/bindings/claim
+    confirm: /api/bindings/confirm
+    revoke: /api/bindings/revoke
+    refresh_name: /api/bindings/refresh-name/<binding_id>
+  require_active_for_routing: false
 
 trigger_prompts:
   chatgpt: >-

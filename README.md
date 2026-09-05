@@ -2,7 +2,7 @@
 
 > ChatGPT ↔ GitHub ↔ Codex Agent 项目交接仓库。
 >
-> 当前状态：**交接仓库已初始化，尚未绑定具体项目目标或创建真实任务 PR。**
+> 当前状态：**本仓库现在服务于“本地 GitHub ↔ ChatGPT Web 触发器”项目；实现分支正在建立，尚未创建真实任务 PR。**
 > Git 保存历史，当前 HEAD 只表达当前有效协议与项目事实。
 
 ## 1. 本仓库的用途
@@ -42,7 +42,7 @@ Codex Agent继续执行
 5. `coordination/README.md`
 6. 若存在开放 PR，再读取对应 `coordination/PR-<N>/`
 
-当前尚无真实 PR，因此 **不得预建虚构的 `coordination/PR-N/` 目录**。
+当前尚无真实 PR，因此 **不得预建虚构的 `coordination/PR-N/` 目录**。本次实现分支创建真实 PR 后，才实例化其三文件目录。
 
 ## 3. 三文件协议
 
@@ -124,12 +124,41 @@ PR 合并后，应从 HEAD 删除对应 `coordination/PR-<N>/`；过程历史由
 ## 8. 当前项目事实
 
 - 交接仓库：`yeuei/gpt---github---codex`
-- 当前阶段：交接框架初始化完成
-- 具体项目目标：尚未提供
+- 当前阶段：本地触发器 V1 实现与闭环模拟
+- 具体项目目标：在用户本机持续运行一个确定性触发器，通过 GitHub 将 Local Codex Agent 与固定的 ChatGPT Web 对话连接起来。
 - 真实任务 PR：无
-- 当前技术规范：尚未定义，见 `docs/技术规范.md`
-- 自动事件触发：默认关闭，见 `coordination/coordination.yaml`
+- 当前技术规范：见 `docs/技术规范.md`
+- 自动事件触发：由本机 Dashboard 控制；默认启用人工审批门，另有明确的“自动审批模式”按钮可同时批准并发送，见 `coordination/coordination.yaml` 与 `trigger/README.md`
+
+本次行动的唯一首个可关闭目标、验收顺序、当前未决项和完成定义见
+[`docs/本次模拟交接任务.md`](docs/本次模拟交接任务.md)。后续 ChatGPT 或 Agent
+进入本仓库时，必须先读该文件，再根据真实 PR 状态继续；不得把历史提交数量或旧聊天当作任务完成证据。
+
+本次 V1 的验收范围：
+
+1. 本地守护程序从 GitHub commit trailer 识别事件、去重并记录时间线；
+2. Dashboard 能总暂停、独立开关两个方向，并逐条人工批准；
+3. `agent → ChatGPT Web` 仅通过固定 `open-browser-use` CLI 流程操作用户选择的真实 Chrome profile；
+4. `ChatGPT Web → agent` 只启动用户明确配置的本地命令；
+5. 用真实 GitHub 分支/PR 和 remote ChatGPT Chat 模拟至少一次闭环；任何卡住或循环均记录并用于更新协议。
 
 ## 9. 权限故障
 
 如果 ChatGPT/Agent 发现仓库不可见、只能读不能写，或无法创建 branch / PR / commit，不得声称操作成功。应检查 GitHub App 的 repository access，权限恢复后从当前 HEAD 继续核验。
+
+## 10. 通用 Web ↔ Local Agent 配对
+
+触发器支持针对当前配置仓库、分支和真实 PR 的显式配对。ChatGPT 端必须提供当前 Web 对话的稳定 `web_conversation_id`；不得从页面标题、URL 猜测或把事件广播给多个 Agent。
+
+配对记录至少包含 `binding_id`、`route_id`、`repository`、`branch`、`pr_number`、`web_conversation_id`、`local_agent_id`、`local_conversation_id`、创建/过期/更新时间，并按以下状态迁移：
+
+```text
+pending → claimed → active
+pending/claimed → expired | revoked | conflict
+```
+
+`POST /api/bindings/invite` 生成短期一次性 token；Local Agent 用 `POST /api/bindings/claim` 登记自己的 route/实例/对话，再用返回的 confirm token 调用 `/api/bindings/confirm`。SQLite 只保存 token 哈希，token 不写日志；同一仓库/分支/PR 同时只能有一个 `active` binding，竞争认领或确认明确返回 conflict。`GET /api/bindings` 只读展示状态，刷新 Web 对话名称在云端不可访问时必须报错且不改变绑定。
+
+## 11. 发布与安装
+
+Dashboard/runtime 归属于本仓库的 `trigger/`；Local Agent skill 是安装、调度和健康观测入口，协议模板保持通用并以 tag/commit 快照引用。启动命令与兼容性见 [`release/README.md`](release/README.md)。
