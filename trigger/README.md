@@ -73,3 +73,20 @@ The event payload is only a wake-up. Both parties must re-read GitHub HEAD and
 the relevant coordination files before acting. A `needs human` status captures
 missing browser setup, a missing conversation URL, or an unconfigured agent
 command without retrying in a loop.
+
+## Explicit binding
+
+The optional binding layer pairs one real repository/branch/PR with one stable
+ChatGPT Web conversation and one Local Agent route. ChatGPT supplies
+`web_conversation_id` explicitly; the trigger never derives it from a title or
+browser tab. Use `POST /api/bindings/invite` to create a short-lived one-time
+token, `POST /api/bindings/claim` for the Local Agent to register the same
+repository/branch/PR plus `route_id`/`local_agent_id`/`local_conversation_id`, and
+`POST /api/bindings/confirm` with the returned confirm token to activate it.
+`GET /api/bindings` is read-only; revoke and refresh-name endpoints are
+explicit and auditable. SQLite stores only token hashes. The state machine is
+`pending → claimed → active` with `expired`, `revoked`, and `conflict`
+terminal states, and one active binding per repository/branch/PR. Set
+`binding.require_active=true` only after pairing is confirmed; otherwise the
+legacy V1 route remains available and unpaired events are not falsely reported
+as active.

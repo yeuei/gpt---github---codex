@@ -145,3 +145,20 @@ PR 合并后，应从 HEAD 删除对应 `coordination/PR-<N>/`；过程历史由
 ## 9. 权限故障
 
 如果 ChatGPT/Agent 发现仓库不可见、只能读不能写，或无法创建 branch / PR / commit，不得声称操作成功。应检查 GitHub App 的 repository access，权限恢复后从当前 HEAD 继续核验。
+
+## 10. 通用 Web ↔ Local Agent 配对
+
+触发器支持针对当前配置仓库、分支和真实 PR 的显式配对。ChatGPT 端必须提供当前 Web 对话的稳定 `web_conversation_id`；不得从页面标题、URL 猜测或把事件广播给多个 Agent。
+
+配对记录至少包含 `binding_id`、`route_id`、`repository`、`branch`、`pr_number`、`web_conversation_id`、`local_agent_id`、`local_conversation_id`、创建/过期/更新时间，并按以下状态迁移：
+
+```text
+pending → claimed → active
+pending/claimed → expired | revoked | conflict
+```
+
+`POST /api/bindings/invite` 生成短期一次性 token；Local Agent 用 `POST /api/bindings/claim` 登记自己的 route/实例/对话，再用返回的 confirm token 调用 `/api/bindings/confirm`。SQLite 只保存 token 哈希，token 不写日志；同一仓库/分支/PR 同时只能有一个 `active` binding，竞争认领或确认明确返回 conflict。`GET /api/bindings` 只读展示状态，刷新 Web 对话名称在云端不可访问时必须报错且不改变绑定。
+
+## 11. 发布与安装
+
+Dashboard/runtime 归属于本仓库的 `trigger/`；Local Agent skill 是安装、调度和健康观测入口，协议模板保持通用并以 tag/commit 快照引用。启动命令与兼容性见 [`release/README.md`](release/README.md)。

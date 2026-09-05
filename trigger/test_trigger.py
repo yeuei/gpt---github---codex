@@ -53,6 +53,195 @@ class TriggerTests(unittest.TestCase):
             finally:
                 trigger.APPROVAL_DIR = original
 
+    def test_dashboard_keeps_raw_event_key_until_the_approval_request(self):
+        """The event button must not URL-encode a key before ``approve`` does."""
+        self.assertIn('data-event-key', trigger.HTML)
+        self.assertIn('approve(button.dataset.eventKey)', trigger.HTML)
+        self.assertNotIn("approve('${encodeURIComponent(e.event_key)}')", trigger.HTML)
+
+    def test_repository_status_is_read_only_and_identifies_the_configured_repo(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / "repo"; repo.mkdir()
+            config = {"handoff_repo": str(repo), "remote": "origin", "watch_branches": "all",
+                      "repository": "owner/repo", "chatgpt": {}, "agent": {}}
+            service = trigger.Service(config, trigger.Store(Path(directory) / "state.sqlite3"))
+            status = service.repository_status()
+            self.assertEqual(status["name"], "owner/repo")
+            self.assertEqual(status["local_path"], str(repo.resolve()))
+            self.assertEqual(status["watch_branches"], "全部远端分支")
+            self.assertFalse(status["can_switch_live"])
+
+    def test_task_document_reads_only_the_allowed_handoff_file(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / "repo"; (repo / "coordination/PR-7").mkdir(parents=True)
+            task = repo / "coordination/PR-7/任务.md"
+            task.write_text("# 任务\n- [x] 完成\n- [~] 进行中\n", encoding="utf-8")
+            config = {"handoff_repo": str(repo), "remote": "origin", "watch_branches": "all",
+                      "repository": "owner/repo", "chatgpt": {}, "agent": {}}
+            service = trigger.Service(config, trigger.Store(Path(directory) / "state.sqlite3"))
+            document = service.task_document(7)
+            self.assertTrue(document["ok"])
+            self.assertEqual(document["path"], "coordination/PR-7/任务.md")
+            self.assertIn("进行中", document["content"])
+            self.assertEqual(document["sections"][0]["items"][0]["state"], "done")
+            self.assertEqual(document["sections"][0]["items"][1]["state"], "in-progress")
+            self.assertEqual(service.task_document()["path"], document["path"])
+            self.assertFalse(service.task_document(8)["ok"])
+
+    def test_task_document_counts_real_completed_subtasks_without_counting_status_legend(self):
+        config = {"handoff_repo": str(Path.cwd()), "remote": "origin", "watch_branches": "all",
+                  "repository": "owner/repo", "chatgpt": {}, "agent": {}}
+        service = trigger.Service(config, trigger.Store(Path(tempfile.mkdtemp()) / "state.sqlite3"))
+        document = service.task_document(1)
+        self.assertTrue(document["all_complete"])
+        self.assertEqual(document["state_counts"]["done"], 6)
+        self.assertEqual(sum(document["state_counts"].values()), 6)
+        self.assertIn("真实任务文件当前全部完成", document["summary"])
+
+    def test_task_history_is_dynamic_and_separates_historical_state_from_current(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / "repo"; task_dir = repo / "coordination/PR-7"; task_dir.mkdir(parents=True)
+            trigger.run(["git", "init", "-q"], repo)
+            trigger.run(["git", "config", "user.email", "test@example.com"], repo)
+            trigger.run(["git", "config", "user.name", "Test"], repo)
+            task = task_dir / "任务.md"
+            task.write_text("## 子任务\n- [ ] T7.1 初始\n", encoding="utf-8")
+            trigger.run(["git", "add", "coordination/PR-7/任务.md"], repo)
+            trigger.run(["git", "commit", "-qm", "start"], repo)
+            first = trigger.run(["git", "rev-parse", "HEAD"], repo).strip()
+            task.write_text("## 子任务\n- [x] T7.1 初始\n", encoding="utf-8")
+            trigger.run(["git", "add", "coordination/PR-7/任务.md"], repo)
+            trigger.run(["git", "commit", "-qm", "finish"], repo)
+            second = trigger.run(["git", "rev-parse", "HEAD"], repo).strip()
+            config = {"handoff_repo": str(repo), "remote": "origin", "watch_branches": "all",
+                      "repository": "owner/repo", "chatgpt": {}, "agent": {}}
+            service = trigger.Service(config, trigger.Store(Path(directory) / "state.sqlite3"))
+            history = service.task_history(7)
+            self.assertTrue(history["ok"])
+            self.assertEqual(history["path"], "coordination/PR-7/任务.md")
+            self.assertEqual(history["history_count"], 2)
+            self.assertEqual(history["snapshots"][0]["commit_sha"], first)
+            self.assertEqual(history["snapshots"][-1]["commit_sha"], second)
+            self.assertFalse(history["snapshots"][0]["all_complete"])
+            self.assertEqual(history["snapshots"][0]["state_counts"]["todo"], 1)
+            self.assertTrue(history["snapshots"][-1]["all_complete"])
+            self.assertTrue(history["current"]["all_complete"])
+
+    def test_binding_state_machine_is_single_use_and_single_active_per_target(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / "repo"; repo.mkdir()
+            config = {"handoff_repo": str(repo), "remote": "origin", "repository": "owner/repo",
+                      "chatgpt": {}, "agent": {}}
+            store = trigger.Store(Path(directory) / "state.sqlite3")
+            service = trigger.Service(config, store)
+            invite = service.create_binding({"repository": "owner/repo", "branch": "main", "pr_number": 7,
+                                             "web_conversation_id": "conv-7", "web_conversation_title": "Example chat"})
+            self.assertTrue(invite["ok"])
+            self.assertNotIn("token_hash", invite["binding"])
+            claim = service.claim_binding({"binding_id": invite["binding"]["binding_id"], "token": invite["token"],
+                                           "route_id": "route-7", "local_agent_id": "agent-7", "local_conversation_id": "local-7",
+                                           "repository": "owner/repo", "branch": "main", "pr_number": 7})
+            self.assertTrue(claim["ok"])
+            repeated = service.claim_binding({"binding_id": invite["binding"]["binding_id"], "token": invite["token"],
+                                               "route_id": "route-other", "local_agent_id": "agent-other", "local_conversation_id": "local-other",
+                                               "repository": "owner/repo", "branch": "main", "pr_number": 7})
+            self.assertFalse(repeated["ok"])
+            active = service.confirm_binding({"binding_id": invite["binding"]["binding_id"], "confirm_token": claim["confirm_token"],
+                                              "route_id": "route-7", "local_agent_id": "agent-7", "local_conversation_id": "local-7",
+                                              "repository": "owner/repo", "branch": "main", "pr_number": 7})
+            self.assertEqual(active["status"], "active")
+            duplicate = service.create_binding({"repository": "owner/repo", "branch": "main", "pr_number": 7,
+                                                 "web_conversation_id": "conv-other"})
+            self.assertEqual(duplicate["status"], "conflict")
+            self.assertEqual(service.active_binding_for_event({"ref": "origin/main", "pr_number": 7})["route_id"], "route-7")
+            refresh = service.refresh_binding_name(invite["binding"]["binding_id"])
+            self.assertFalse(refresh["ok"])
+            self.assertIn("云端元数据不可访问", refresh["error"])
+            revoked = service.revoke_binding({"binding_id": invite["binding"]["binding_id"], "token": invite["token"]})
+            self.assertEqual(revoked["status"], "revoked")
+
+    def test_dashboard_contains_repository_configuration_and_pr_timeline_surfaces(self):
+        source = MODULE.read_text(encoding="utf-8")
+        self.assertIn('当前交接仓库', trigger.HTML)
+        self.assertIn('不提供运行中热切换', trigger.HTML)
+        self.assertIn('PR 交接时间线', trigger.HTML)
+        self.assertIn('color-scheme:light', trigger.HTML)
+        self.assertIn('timeline-card:not(:last-child)::after', trigger.HTML)
+        self.assertIn('aria-expanded', trigger.HTML)
+        self.assertIn('baseRenderTimeline', trigger.HTML)
+        self.assertIn('timelineCardKey', trigger.HTML)
+        self.assertIn('expanded.has(timelineCardKey(card))', trigger.HTML)
+        self.assertIn('prefers-reduced-motion', trigger.HTML)
+        self.assertIn('canvas-viewport', trigger.HTML)
+        self.assertIn('canvas-pr-filter', trigger.HTML)
+        self.assertIn('canvas-edge', trigger.HTML)
+        self.assertIn('canvas-detail', trigger.HTML)
+        self.assertIn('pointerdown', trigger.HTML)
+        self.assertIn('canvas-fit', trigger.HTML)
+        self.assertIn("legacyEvents.style.display='none'", trigger.HTML)
+        self.assertIn('selectedEventKey', trigger.HTML)
+        self.assertIn('zoomCanvas', trigger.HTML)
+        self.assertIn('zoomCanvasAt', trigger.HTML)
+        self.assertIn('getBoundingClientRect', trigger.HTML)
+        self.assertIn('event.clientX', trigger.HTML)
+        self.assertIn('canvas-reset', trigger.HTML)
+        self.assertIn('canvasTracks', trigger.HTML)
+        self.assertIn('unassigned:chain:', trigger.HTML)
+        self.assertIn('caused_by===key', trigger.HTML)
+        self.assertIn('track.edges', trigger.HTML)
+        self.assertIn('全部轨道', trigger.HTML)
+        self.assertIn('/api/task', trigger.HTML)
+        self.assertIn('任务.md / 交接进度', trigger.HTML)
+        self.assertIn('展开完整任务.md', trigger.HTML)
+        self.assertIn('taskOpenByEvent', trigger.HTML)
+        self.assertIn('taskOpenState', trigger.HTML)
+        self.assertIn('task-document-details', trigger.HTML)
+        self.assertIn('task-document-other', trigger.HTML)
+        self.assertIn('disclosure.addEventListener', trigger.HTML)
+        self.assertIn('otherDisclosure.addEventListener', trigger.HTML)
+        self.assertIn('state.raw', trigger.HTML)
+        self.assertIn('state.other', trigger.HTML)
+        self.assertIn('atBottom', trigger.HTML)
+        self.assertIn('pageMax', trigger.HTML)
+        self.assertIn('收起原始任务.md', trigger.HTML)
+        self.assertIn('task-item', trigger.HTML)
+        self.assertIn('renderTaskSections', trigger.HTML)
+        self.assertIn('查看原始任务.md', trigger.HTML)
+        self.assertIn('captureScrollPosition', trigger.HTML)
+        self.assertIn('restoreScrollPosition', trigger.HTML)
+        self.assertIn('window.scrollTo', trigger.HTML)
+        self.assertIn('preserveScrollSelector', trigger.HTML)
+        self.assertIn('task-document-raw', trigger.HTML)
+        self.assertIn('task-complete-note', trigger.HTML)
+        self.assertIn('all_complete', trigger.HTML)
+        self.assertIn('task_history', source)
+        self.assertIn('/api/task/history', source)
+        self.assertIn('matchTaskHistory', trigger.HTML)
+        self.assertIn('commit_sha', trigger.HTML)
+        self.assertIn('event_time', trigger.HTML)
+        self.assertIn('无历史快照', trigger.HTML)
+        self.assertIn('该事件时点的任务进度', trigger.HTML)
+        self.assertIn('当前最新任务进度', trigger.HTML)
+        self.assertIn('安全配对绑定', trigger.HTML)
+        self.assertIn('/api/bindings/invite', source)
+        self.assertIn('suffix == "claim"', source)
+        self.assertIn('suffix == "confirm"', source)
+        self.assertIn('suffix == "revoke"', source)
+        self.assertIn('/api/bindings/refresh-name/', source)
+        self.assertIn('active_binding_for_event', source)
+        self.assertIn('require_active', source)
+        self.assertIn('statusFingerprint', trigger.HTML)
+        self.assertIn('changed=fingerprint!==lastStatusFingerprint', trigger.HTML)
+        self.assertIn('browser?.state', trigger.HTML)
+        self.assertNotIn('browser:data.browser,repository', trigger.HTML)
+        self.assertIn('position:sticky', trigger.HTML)
+        self.assertIn('overscroll-behavior:contain', trigger.HTML)
+        self.assertIn('height:min(72vh,720px)', trigger.HTML)
+        self.assertIn('max-width:900px', trigger.HTML)
+        self.assertIn('lastUserScrollAt', trigger.HTML)
+        self.assertIn('restoringScroll', trigger.HTML)
+        self.assertIn('detailTop=detail.scrollTop', trigger.HTML)
+
     def test_commit_trailers_are_case_insensitive(self):
         commit = trigger.Commit("a" * 40, "Coordination-Origin: AGENT\nCoordination-Event-Id: evt-1\nCoordination-Caused-By: parent", "update")
         self.assertEqual(commit.origin, "agent")

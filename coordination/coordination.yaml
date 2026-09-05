@@ -74,6 +74,35 @@ deduplication:
     - head_sha
     - origin
 
+binding:
+  enabled: true
+  schema_version: binding.v1
+  states: [pending, claimed, active, expired, revoked, conflict]
+  target_key: [repository, branch, pr_number]
+  required_fields:
+    - binding_id
+    - route_id
+    - repository
+    - branch
+    - pr_number
+    - web_conversation_id
+    - local_agent_id
+    - local_conversation_id
+    - created_at
+    - expires_at
+    - updated_at
+  token_policy: short_lived_single_use_hash_only
+  active_binding_limit: one_per_repository_branch_pr
+  title_policy: display_only_never_a_route_key
+  endpoints:
+    read: /api/bindings
+    invite: /api/bindings/invite
+    claim: /api/bindings/claim
+    confirm: /api/bindings/confirm
+    revoke: /api/bindings/revoke
+    refresh_name: /api/bindings/refresh-name/<binding_id>
+  require_active_for_routing: false
+
 trigger_prompts:
   chatgpt: >-
     GitHub 协作事件：PR #{pr_number} 已由 Agent 更新。

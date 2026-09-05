@@ -11,5 +11,8 @@
   },
   "agent": {
     "command": ["/absolute/path/to/trigger/codex-agent-wrapper"]
+  },
+  "binding": {
+    "require_active": false
   }
 }
