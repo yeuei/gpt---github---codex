@@ -1,127 +1,53 @@
-schema_version: coordination.v2
-
+version: coordination.v3
 project:
-  project_id: "gpt---github---codex"
-  repository: "yeuei/gpt---github---codex"
-  intent_document: "docs/本次模拟交接任务.md"
-  current_goal: "完成本地触发器 V1 的审批式双向模拟交接"
-  completion_requires_real_pr: true
+  repository: yeuei/gpt---github---codex
+  current_goal: local-first Dashboard with exact historical task snapshots and separated state domains
+  dashboard_runtime: trigger/
 
-clients:
-  chatgpt:
-    client_id: "chatgpt"
-    role: "planner_coordinator"
-  agent:
-    client_id: "codex-agent"
-    role: "local_executor"
+sources:
+  default: local_git
+  background_network_access: false
+  explicit_github_refresh:
+    endpoint: /api/refresh-github
+    command: git fetch <remote> --prune --quiet
+    preserve_local_event_state_on_failure: true
 
-event_protocol:
-  enabled: true
-  required_fields:
-    - event_id
-    - repository
-    - pr_number
-    - action
-    - head_sha
-    - origin
-    - client_id
-  optional_fields:
-    - caused_by_event_id
-    - delivery_id
-    - created_at
+history:
+  task_snapshot:
+    key: [pr_number, commit_sha]
+    git_object: coordination/PR-<N>/任务.md
+    exact_sha_only: true
+    fallback_to_event_time: false
+    fallback_to_current_task: false
+
+state_domains:
+  trigger_approval: approval_state
+  delivery_execution: delivery_state
+  github_pr: github_pr_state
+  cross_domain_inference: forbidden
+  legacy_unseparated_value: legacy_unknown
 
 routing:
-  agent_origin:
-    notify:
-      - chatgpt
-    suppress:
-      - agent
-  chatgpt_origin:
-    notify:
-      - agent
-    suppress:
-      - chatgpt
-
-local_trigger:
-  implementation: "trigger/trigger.py"
-  dashboard_bind: "127.0.0.1"
-  dashboard_port: 8765
-  default_poll_interval_seconds: 15
-  default_approval_required: true
-  default_auto_submit: false
-  auto_mode_ui: "自动审批模式"
-  auto_mode_default: false
-  auto_mode_endpoint: "/api/mode"
-  browser_adapter: "open-browser-use"
-  chatgpt_mode: "web_chat"
-  configuration_file: "trigger/config.local.json"
-  configuration_is_gitignored: true
-  browser_health_endpoint: "/api/browser/check"
-  browser_health_ui: "检测浏览器连接"
-  reconnect_policy: "long_lived_session_then_stale_registry_cleanup_and_retry"
-
-origin_values:
-  - agent
-  - chatgpt
-  - human
-  - external
-
-deduplication:
-  primary_key: event_id
-  secondary_key:
-    - repository
-    - pr_number
-    - head_sha
-    - origin
+  event_trailers:
+    origin: Coordination-Origin
+    event_id: Coordination-Event-Id
+    caused_by: Coordination-Caused-By
+  event_id_dedup: true
+  missing_pr_number: unassigned
+  do_not_invent_pr_number: true
 
 binding:
-  enabled: true
-  schema_version: binding.v1
+  version: binding.v1
   states: [pending, claimed, active, expired, revoked, conflict]
-  target_key: [repository, branch, pr_number]
-  required_fields:
-    - binding_id
-    - route_id
-    - repository
-    - branch
-    - pr_number
-    - web_conversation_id
-    - local_agent_id
-    - local_conversation_id
-    - created_at
-    - expires_at
-    - updated_at
-  token_policy: short_lived_single_use_hash_only
-  active_binding_limit: one_per_repository_branch_pr
-  title_policy: display_only_never_a_route_key
-  endpoints:
-    read: /api/bindings
-    invite: /api/bindings/invite
-    claim: /api/bindings/claim
-    confirm: /api/bindings/confirm
-    revoke: /api/bindings/revoke
-    refresh_name: /api/bindings/refresh-name/<binding_id>
-  require_active_for_routing: false
+  one_active_per_target: true
+  token_storage: local_hash_only
+  share_token_location: url_fragment
 
-trigger_prompts:
-  chatgpt: >-
-    GitHub 协作事件：PR #{pr_number} 已由 Agent 更新。
-    请读取该 PR 最新 diff、任务.md 与 agent汇报.md，按照 ChatGPT 协作职责处理。
-    本事件只负责唤醒；GitHub 当前文件才是正式任务与状态真源。
-  agent: >-
-    GitHub 协作事件：PR #{pr_number} 已由 ChatGPT 更新。
-    请 fetch/pull 最新远端状态，读取任务.md 与 chatgpt解惑.md，
-    核对本地实际状态后继续执行。本事件只负责唤醒；不要重复已完成任务。
-
-commit_trailers:
-  origin: "Coordination-Origin"
-  client: "Coordination-Client"
-  event_id: "Coordination-Event-Id"
-  caused_by_event_id: "Coordination-Caused-By"
+approvals:
+  trigger_event_approval_is_separate_from_codex_app_server: true
+  codex_policy: workspace-write + on-request
 
 security:
-  store_secrets_in_repository: false
-  pairing_design_note: >-
-    如果未来接入 Coordination Hub，应为 ChatGPT 和 Agent 分配不同设备凭据，
-    通过同一 pair_id 关联，而不是共享同一个 API key。MFA 用于初次设备配对、
-    凭据轮换和敏感权限变更，不应要求每次 WebSocket 重连都重新 MFA。
+  dashboard_bind: 127.0.0.1
+  secrets_in_git: forbidden
+  browser_cookie_access: forbidden

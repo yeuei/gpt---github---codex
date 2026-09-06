@@ -1,0 +1,42 @@
+name: trigger-tests
+on:
+  pull_request:
+    paths:
+      - 'trigger/**'
+      - 'docs/**'
+      - 'README.md'
+      - 'coordination/**'
+      - '.github/workflows/trigger-tests.yml'
+  push:
+    branches:
+      - 'refactor/local-git-dashboard'
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Python compile
+        run: python -m py_compile trigger/trigger.py trigger/test_trigger.py trigger/codex-agent-app-server.py
+      - name: Unit tests
+        run: python -m unittest trigger/test_trigger.py -v
+      - name: Dashboard JavaScript syntax
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import re
+          text = Path('trigger/dashboard.html').read_text()
+          Path('/tmp/dashboard.js').write_text('\n'.join(re.findall(r'<script>(.*?)</script>', text, re.S)))
+          PY
+          node --check /tmp/dashboard.js
+      - name: Git whitespace check
+        run: |
+          if [ -n "$GITHUB_BASE_REF" ]; then
+            git diff --check "origin/$GITHUB_BASE_REF...HEAD"
+          else
+            git show --check --oneline HEAD
+          fi

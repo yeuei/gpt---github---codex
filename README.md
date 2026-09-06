@@ -1,164 +1,146 @@
 # gpt---github---codex
 
-> ChatGPT ↔ GitHub ↔ Codex Agent 项目交接仓库。
+> ChatGPT ↔ GitHub ↔ Local Agent 的交接实例与本机 Dashboard/runtime。
 >
-> 当前状态：**本仓库现在服务于“本地 GitHub ↔ ChatGPT Web 触发器”项目；实现分支正在建立，尚未创建真实任务 PR。**
-> Git 保存历史，当前 HEAD 只表达当前有效协议与项目事实。
+> Git 保存历史；当前 HEAD 只表达当前有效协议、代码和项目事实。
 
-## 1. 本仓库的用途
+## 1. 本仓库服务什么
 
-本仓库用于让 ChatGPT、GitHub、本地 Codex Agent 与用户形成稳定的项目协调闭环：
+本实例用于运行一条可审计的协作链路：
 
 ```text
 用户
   ↓
-ChatGPT（规划与协调）
+ChatGPT（规划 / GitHub 协调）
   ↓
-GitHub：任务.md
+GitHub 交接仓库
   ↓
-Codex Agent（本地执行）
+Local Agent（本地执行）
   ↓
-代码 / 实验 / 本地运行
+本地 Git / runtime / SQLite 证据
   ↓
-GitHub：agent汇报.md
-  ↓
-ChatGPT：chatgpt解惑.md
-  ↓
-Codex Agent继续执行
+Dashboard
 ```
 
-只有真正会改变科研、产品或正式实验核心口径的问题才升级给用户决策。
+Dashboard 是**本地观察与审批界面**，不是第四套任务真源。正式任务仍由真实 PR 的
+`coordination/PR-<N>/` 三文件表达，历史状态由 Git commit 保存。
 
-## 2. 第一次进入本仓库
+## 2. 协议区
 
-无论是 ChatGPT 还是 Agent，都必须先读取 GitHub 当前 HEAD，不能用旧聊天、旧本地状态或旧 handoff 冒充当前事实。
+### 2.1 事实优先级
 
-推荐阅读顺序：
+- “现在应该做什么”：用户最新指令 > 当前 `任务.md` > 当前 `chatgpt解惑.md` > 当前规范。
+- “实际上做到哪里”：本地/远端真实 commit、runtime 证据 > 最新 `agent汇报.md` > 任务状态。
+- 不用旧聊天、旧 renderer、旧 runner 或旧任务文件冒充当前事实。
 
-1. `README.md`
-2. `docs/项目总览.md`
-3. `docs/技术规范.md`
-4. `docs/协作协议.md`
-5. `coordination/README.md`
-6. 若存在开放 PR，再读取对应 `coordination/PR-<N>/`
+### 2.2 PR 与三文件
 
-当前尚无真实 PR，因此 **不得预建虚构的 `coordination/PR-N/` 目录**。本次实现分支创建真实 PR 后，才实例化其三文件目录。
-
-## 3. 三文件协议
-
-每个真实且需要交接的开放 PR 原则上对应：
+只有真实且开放、需要交接的 PR 才在 HEAD 保留：
 
 ```text
-coordination/PR-<N>/
-├── 任务.md
-├── agent汇报.md
-└── chatgpt解惑.md
+coordination/PR-<真实编号>/
+├── 任务.md          # 累积任务合同
+├── agent汇报.md      # Agent 当前现实快照
+└── chatgpt解惑.md    # ChatGPT 当前决策快照
 ```
 
-三者职责必须分开：
+PR 合并后从 HEAD 删除对应目录；历史仍可通过 Git commit 读取。一个 PR 只服务一个可独立关闭的总目标。
 
-- `任务.md`：累积性任务合同。ChatGPT 创建/追加任务；Agent 只根据真实执行修改状态。
-- `agent汇报.md`：Agent 当前现实快照。每次重要 push 完整覆盖，不累计聊天历史。
-- `chatgpt解惑.md`：ChatGPT 当前有效决策/解答。新的核心决策产生时完整覆盖。
+### 2.3 Dashboard 数据源
 
-状态统一使用：
+默认路径完全本地化：
 
 ```text
-[ ] TODO
-[~] RUNNING
-[x] DONE
-[!] BLOCKED
-[?] WAITING_USER
-[-] SUPERSEDED
+本地 Git clone / refs / commit history
+        ↓
+Trigger 本地扫描
+        ↓
+SQLite 事件与审批/投递审计
+        ↓
+Dashboard
 ```
 
-## 4. 决策权限
+后台轮询**不访问 GitHub 网络**。只有用户点击 **“从 GitHub 刷新”** 或显式执行
+`--refresh-once` 时才运行 `git fetch`。刷新失败时，当前事件/审批/投递状态保持不变，界面显示准确错误。
 
-### Codex Agent 默认自行决定
+### 2.4 历史任务快照
 
-普通工程实现，例如：路径、manifest 普通字段、row-id、deterministic seed、JSON/JSONL、logging、retry、resume、普通 bug、worker/batching 等。
-
-### ChatGPT 默认可以决定
-
-任务拆分、优先级、并行关系、blocker 是否真正阻塞主线、旧实现是否已被新规范覆盖、是否需要外部研究、Agent 是否可自行冻结工程细节。
-
-### 必须请求用户决定
-
-会显著改变项目正式定义的问题，例如：核心数据源/比例、正式训练数据规模、模型替换、reward、benchmark、tool cap、核心 prompt 目标、算法主路线或对外核心结论。
-
-## 5. Blocker 处理硬规则
-
-Agent 上报 blocker 后，ChatGPT 必须在当前轮形成以下之一：
+每个事件节点只允许按自身 commit SHA 读取：
 
 ```text
-A. 直接解决
-B. 授权 Agent 自行决定
-C. 请求用户做最小化决策
+git show <event_sha>:coordination/PR-<N>/任务.md
 ```
 
-禁止只回复“先解决 blocker 再继续”。局部 blocker 不得无理由阻塞其它无依赖任务。
+如果该 commit 不存在对应文件，显示“历史任务快照不可用”。禁止：
 
-## 6. Git 与文档原则
+- 按事件时间寻找最近任务提交；
+- 用当前工作树 `任务.md` 代替历史节点；
+- 根据最终完成状态回填早期节点。
+
+### 2.5 三类状态严格分离
+
+Dashboard 分别显示：
+
+1. **Trigger 审批状态**：等待审批 / 人工批准 / 自动批准 / 无需审批 / 旧记录未知；
+2. **投递/执行状态**：未投递 / 已填草稿 / 已发送 / 已启动 Agent / 需人工处理 / 已跳过；
+3. **GitHub PR 状态**：来自显式 GitHub 刷新得到的缓存；未同步时明确显示未知。
+
+任何一类状态都不得反推另一类。旧 SQLite 记录若无法可靠拆分，标为 `legacy_unknown`，不猜测。
+
+### 2.6 两层审批不可混用
+
+- Trigger 审批：是否路由一个 GitHub 协作事件；
+- Codex app-server 审批：是否允许具体 shell / file 操作。
+
+Trigger 的自动审批模式不会自动授予 Codex 命令或文件权限。
+
+### 2.7 Binding 配对
+
+配对遵守 `binding.v1`：`pending → claimed → active`，并允许 `expired / revoked / conflict`。
+本机 `/pair` 通过 `/api/bindings/invite` 生成真实短期一次性 token，复制链接只把 token 放入 URL fragment。
+ChatGPT 无法访问 localhost 时不得编造 token 或链接。
+
+## 3. 当前项目事实
+
+本节只维护当前有效事实，不保存版本历史。
+
+- 仓库：`yeuei/gpt---github---codex`
+- 默认分支：`main`
+- PR #1：已合并；merge commit `1323dbde24666ed3da8911a9b90a29cf210283be`
+- PR #2：当前为独立的“配对链接修复”开放工作；不是本次 local-first Dashboard 重构的事实真源
+- 本次重构分支：`refactor/local-git-dashboard`
+- 本次重构的真实 PR：尚未创建；创建后在本节和 `coordination/PR-<N>/` 使用真实编号更新
+- Dashboard runtime 真源：`trigger/`
+- Dashboard 默认数据源：本地 Git clone + 本地 SQLite
+- 显式网络入口：Dashboard “从 GitHub 刷新” / `python trigger/trigger.py --refresh-once`
+
+## 4. 阅读路径
+
+1. 本 README；
+2. `docs/项目总览.md`；
+3. `docs/技术规范.md`；
+4. `docs/协作协议.md`；
+5. `trigger/README.md`；
+6. 当前开放 PR 对应的 `coordination/PR-<N>/`（若存在）。
+
+## 5. 运行入口
+
+```bash
+cd trigger
+cp config.example.json config.local.json
+python3 trigger.py
+```
+
+打开：
 
 ```text
-Git history = 历史
-HEAD = 当前有效事实
+http://127.0.0.1:8765/
 ```
 
-不要创建 `xxx_v2.md`、`xxx_final.md`、`xxx_latest.md` 保存同一规范的历史版本。当前规范直接原位更新；被替代文件应删除，历史由 Git commit 保存。
-
-旧 runner、旧 prompt、旧 config、旧 smoke 可以借鉴，但不得因为过去跑通过就反向定义当前规范。
-
-## 7. 新建真实 PR 时
-
-真实 PR 创建后，把 `coordination/TEMPLATE/` 的三个模板实例化为：
+配对入口：
 
 ```text
-coordination/PR-<真实PR号>/
+http://127.0.0.1:8765/pair
 ```
 
-然后由 ChatGPT 写入可关闭的 PR 总任务与子任务。一个 PR 只服务一个可独立关闭的总目标。
-
-PR 合并后，应从 HEAD 删除对应 `coordination/PR-<N>/`；过程历史由 Git 保留。
-
-## 8. 当前项目事实
-
-- 交接仓库：`yeuei/gpt---github---codex`
-- 当前阶段：本地触发器 V1 实现与闭环模拟
-- 具体项目目标：在用户本机持续运行一个确定性触发器，通过 GitHub 将 Local Codex Agent 与固定的 ChatGPT Web 对话连接起来。
-- 真实任务 PR：无
-- 当前技术规范：见 `docs/技术规范.md`
-- 自动事件触发：由本机 Dashboard 控制；默认启用人工审批门，另有明确的“自动审批模式”按钮可同时批准并发送，见 `coordination/coordination.yaml` 与 `trigger/README.md`
-
-本次行动的唯一首个可关闭目标、验收顺序、当前未决项和完成定义见
-[`docs/本次模拟交接任务.md`](docs/本次模拟交接任务.md)。后续 ChatGPT 或 Agent
-进入本仓库时，必须先读该文件，再根据真实 PR 状态继续；不得把历史提交数量或旧聊天当作任务完成证据。
-
-本次 V1 的验收范围：
-
-1. 本地守护程序从 GitHub commit trailer 识别事件、去重并记录时间线；
-2. Dashboard 能总暂停、独立开关两个方向，并逐条人工批准；
-3. `agent → ChatGPT Web` 仅通过固定 `open-browser-use` CLI 流程操作用户选择的真实 Chrome profile；
-4. `ChatGPT Web → agent` 只启动用户明确配置的本地命令；
-5. 用真实 GitHub 分支/PR 和 remote ChatGPT Chat 模拟至少一次闭环；任何卡住或循环均记录并用于更新协议。
-
-## 9. 权限故障
-
-如果 ChatGPT/Agent 发现仓库不可见、只能读不能写，或无法创建 branch / PR / commit，不得声称操作成功。应检查 GitHub App 的 repository access，权限恢复后从当前 HEAD 继续核验。
-
-## 10. 通用 Web ↔ Local Agent 配对
-
-触发器支持针对当前配置仓库、分支和真实 PR 的显式配对。ChatGPT 端必须提供当前 Web 对话的稳定 `web_conversation_id`；不得从页面标题、URL 猜测或把事件广播给多个 Agent。
-
-配对记录至少包含 `binding_id`、`route_id`、`repository`、`branch`、`pr_number`、`web_conversation_id`、`local_agent_id`、`local_conversation_id`、创建/过期/更新时间，并按以下状态迁移：
-
-```text
-pending → claimed → active
-pending/claimed → expired | revoked | conflict
-```
-
-`POST /api/bindings/invite` 生成短期一次性 token；Local Agent 用 `POST /api/bindings/claim` 登记自己的 route/实例/对话，再用返回的 confirm token 调用 `/api/bindings/confirm`。SQLite 只保存 token 哈希，token 不写日志；同一仓库/分支/PR 同时只能有一个 `active` binding，竞争认领或确认明确返回 conflict。`GET /api/bindings` 只读展示状态，刷新 Web 对话名称在云端不可访问时必须报错且不改变绑定。
-
-## 11. 发布与安装
-
-Dashboard/runtime 归属于本仓库的 `trigger/`；Local Agent skill 是安装、调度和健康观测入口，协议模板保持通用并以 tag/commit 快照引用。启动命令与兼容性见 [`release/README.md`](release/README.md)。
+测试与可复现命令见 `trigger/README.md`。
