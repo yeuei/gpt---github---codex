@@ -1385,8 +1385,15 @@ HTML += r"""<script>
     return originalFetch.call(this,input,init);
   };
   const ensure=()=>{
-    const bar=document.querySelector('.v3bar'); if(!bar || bar.querySelector('[data-manual-github-refresh]')) return;
-    const b=document.createElement('button'); b.type='button'; b.dataset.manualGithubRefresh='1'; b.textContent='从 GitHub 刷新本地历史'; b.onclick=()=>window.refreshGithub?window.refreshGithub():location.reload(); bar.lastElementChild?.append(' ',b);
+    const bar=document.querySelector('.v3bar'); if(!bar)return;
+    const actions=bar.lastElementChild;
+    if(actions && !actions.querySelector('[data-manual-github-refresh]')){
+      const b=document.createElement('button'); b.type='button'; b.dataset.manualGithubRefresh='1'; b.textContent='从 GitHub 刷新本地历史'; b.onclick=async()=>{b.disabled=true;b.textContent='同步中…';try{const data=await fetch('/api/status?refresh=1').then(r=>r.json());if(window.__v3State&&window.__v3Build&&window.__v3Render){window.__v3State.events=window.__v3Build(data);window.__v3Render()}const n=document.querySelector('#notice');if(n){n.textContent=data.github_prs?.error||'GitHub 历史刷新完成';n.style.display='block'}}catch(e){const n=document.querySelector('#notice');if(n){n.textContent='GitHub 刷新失败：'+e.message;n.style.display='block'}}finally{b.disabled=false;b.textContent='从 GitHub 刷新本地历史'}}; actions.append(' ',b);
+    }
+    if(actions && !actions.querySelector('[data-debug-start]')){
+      const b=document.createElement('button'); b.type='button'; b.dataset.debugStart='1'; b.textContent='开始'; b.onclick=()=>document.querySelector('#open-chatgpt-debug')?.click(); actions.append(' ',b);
+    }
+    document.querySelectorAll('.v3node h4').forEach(h=>{if(h.textContent.trim()==='PR #0')h.closest('.v3node')?.remove()});
   };
   setInterval(ensure,300);
 })();
