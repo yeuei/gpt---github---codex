@@ -107,12 +107,16 @@ ChatGPT 无法访问 localhost 时不得编造 token 或链接。
 - 仓库：`yeuei/gpt---github---codex`
 - 默认分支：`main`
 - PR #1：已合并；merge commit `1323dbde24666ed3da8911a9b90a29cf210283be`
-- PR #2：当前为独立的“配对链接修复”开放工作；不是本次 local-first Dashboard 重构的事实真源
-- 本次重构分支：`refactor/local-git-dashboard`
-- 本次重构的真实 PR：尚未创建；创建后在本节和 `coordination/PR-<N>/` 使用真实编号更新
+- PR #2：真实开放、独立的“配对链接修复”工作；不是本次 local-first Dashboard 重构的事实真源
+- PR #3：真实开放；标题 `Local-first Dashboard：按 commit SHA 恢复任务并分离状态`
+- PR #3 branch：`refactor/local-git-dashboard`
+- PR #3 主体重构 commit：`baa15b2678454c0a75fecd0e6d670a945c60cf2f`
+- PR #3 CI 修复 commit：`e411794fe79a322bb39cfd90fe0442c880180602`
+- GitHub Actions：run `34077319339` 在 `e411794…` 上真实 `success`
 - Dashboard runtime 真源：`trigger/`
 - Dashboard 默认数据源：本地 Git clone + 本地 SQLite
 - 显式网络入口：Dashboard “从 GitHub 刷新” / `python trigger/trigger.py --refresh-once`
+- 用户本机 Chrome / Open Browser Use / Codex app-server 在本次远程收口中**未重新复验**，不得由 CI 结果代替
 
 ## 4. 阅读路径
 
