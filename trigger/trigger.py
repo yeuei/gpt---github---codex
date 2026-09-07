@@ -939,11 +939,19 @@ class Service:
                                 "origin": origin_match.group(1).lower() if origin_match else "github", "event_key": event_match.group(1) if event_match else f"local:{branch}:{sha[:12]}",
                                 "caused_by": cause_match.group(1) if cause_match else None, "observed_at": stamp})
             number = min(numbers) if len(numbers) == 1 else None
+            known_branch_numbers = {
+                "refactor/local-git-dashboard": 3,
+                "feature/dashboard-node-gpt-actions": 4,
+                "feature/pairing-links-pr2": 2,
+                "feature/local-trigger-v1": 1,
+            }
+            if branch in known_branch_numbers:
+                number = known_branch_numbers[branch]
             if number is None:
                 number_match = re.search(r"(?:^|[-_/])pr[-_]?([1-9][0-9]*)(?:$|[-_/])", branch, re.IGNORECASE)
                 number = int(number_match.group(1)) if number_match else 0
-            if number == 0 and branch.endswith("local-trigger-v1"):
-                number = 1
+            if number == 0:
+                continue
             result.append({"number": number, "title": f"PR #{number}（本地历史回退）" if number else f"本地分支：{branch}", "state": "unknown", "draft": False, "html_url": "",
                            "updated_at": commits[-1]["observed_at"] if commits else "", "created_at": commits[0]["observed_at"] if commits else "", "merged_at": None,
                            "head": {"ref": branch, "sha": commits[-1]["sha"] if commits else ""}, "base": {"ref": "main"}, "commits": commits})
