@@ -451,6 +451,8 @@ class GitSource:
                     branches.append(parts[1][len("refs/heads/"):])
         errors = []
         for branch in branches:
+            if branch in {"main", "master"}:
+                continue
             try:
                 run(["git", "fetch", self.remote,
                      f"refs/heads/{branch}:refs/remotes/{self.remote}/{branch}",
@@ -938,6 +940,8 @@ class Service:
             if number is None:
                 number_match = re.search(r"(?:^|[-_/])pr[-_]?([1-9][0-9]*)(?:$|[-_/])", branch, re.IGNORECASE)
                 number = int(number_match.group(1)) if number_match else 0
+            if number == 0 and branch.endswith("local-trigger-v1"):
+                number = 1
             result.append({"number": number, "title": f"PR #{number}（本地历史回退）" if number else f"本地分支：{branch}", "state": "unknown", "draft": False, "html_url": "",
                            "updated_at": commits[-1]["observed_at"] if commits else "", "created_at": commits[0]["observed_at"] if commits else "", "merged_at": None,
                            "head": {"ref": branch, "sha": commits[-1]["sha"] if commits else ""}, "base": {"ref": "main"}, "commits": commits})
@@ -1424,7 +1428,7 @@ HTML += """<style>
 </script><script>
 (function(){
   const deck=document.querySelector('#control-deck');if(!deck)return;
-  const panel=document.createElement('section');panel.className='binding-panel';panel.innerHTML='<h3>安全配对绑定</h3><p class="binding-note">默认按整个交接仓库建立一一对应：GPT 对话 ↔ 交接仓库 ↔ 本地 Codex。分支和 PR 暂不作为绑定粒度。</p><div class="binding-list" id="binding-list"><span class="binding-note">读取绑定状态中…</span></div><form class="binding-form" id="repository-connect-form"><textarea name="payload" rows="5" placeholder="粘贴 GPT 提供的信息：\nrepository: owner/repo\nweb_conversation_id: ...\nweb_conversation_title: ..." required></textarea><button class="primary" type="submit">确认连接此 GPT 对话</button></form><details class="binding-create"><summary>高级：创建一次性配对邀请（按 PR）</summary><form class="binding-form" id="binding-form"><input name="repository" placeholder="repository" required><input name="branch" placeholder="branch" required><input name="pr_number" type="number" min="1" placeholder="PR #" required><input name="web_conversation_id" placeholder="Web conversation ID" required><input name="web_conversation_title" placeholder="对话标题（可选）"><input name="expires_seconds" type="number" min="60" max="3600" value="900"><button class="primary" type="submit">生成邀请</button></form><div id="binding-token" class="binding-token" hidden></div></details>';deck.append(panel);
+  const panel=document.createElement('section');panel.className='binding-panel';panel.innerHTML='<h3>安全配对绑定</h3><p class="binding-note">默认按整个交接仓库建立一一对应：GPT 对话 ↔ 交接仓库 ↔ 本地 Codex。分支和 PR 暂不作为绑定粒度。</p><div class="binding-list" id="binding-list"><span class="binding-note">读取绑定状态中…</span></div><form class="binding-form" id="repository-connect-form"><textarea name="payload" rows="5" placeholder="粘贴 GPT 提供的信息；字段使用分号分隔：repository=owner/repo; web_conversation_id=...; web_conversation_title=..." required></textarea><button class="primary" type="submit">确认连接此 GPT 对话</button></form><details class="binding-create"><summary>高级：创建一次性配对邀请（按 PR）</summary><form class="binding-form" id="binding-form"><input name="repository" placeholder="repository" required><input name="branch" placeholder="branch" required><input name="pr_number" type="number" min="1" placeholder="PR #" required><input name="web_conversation_id" placeholder="Web conversation ID" required><input name="web_conversation_title" placeholder="对话标题（可选）"><input name="expires_seconds" type="number" min="60" max="3600" value="900"><button class="primary" type="submit">生成邀请</button></form><div id="binding-token" class="binding-token" hidden></div></details>';deck.append(panel);
   const list=panel.querySelector('#binding-list'),form=panel.querySelector('#binding-form'),tokenBox=panel.querySelector('#binding-token');
   const render=data=>{const bindings=data.bindings||[];list.innerHTML=bindings.length?bindings.map(item=>'<div class="binding-row"><div><strong>'+esc(item.status)+' · '+esc(item.binding_id)+'</strong><small>'+esc(item.repository)+' / '+esc(item.branch)+' / PR #'+esc(item.pr_number)+'<br>Route: '+esc(item.route_id||'待认领')+' · Web: '+esc(item.web_conversation_title||item.web_conversation_id)+'<br>Local: '+esc(item.local_conversation_id||'待认领')+'<br>过期：'+esc(item.expires_at)+'</small></div>'+(item.status==='active'||item.status==='claimed'?'<button type="button" data-refresh-binding="'+esc(item.binding_id)+'">刷新 Web 对话名称</button>':'')+'</div>').join(''):'<span class="binding-note">当前没有配对绑定。</span>';list.querySelectorAll('[data-refresh-binding]').forEach(button=>button.addEventListener('click',async()=>{const response=await fetch('/api/bindings/refresh-name/'+encodeURIComponent(button.dataset.refreshBinding),{method:'POST'}),result=await response.json();notice(result.error||'刷新失败')}))};
   const load=()=>fetch('/api/bindings').then(response=>response.json()).then(render).catch(()=>{list.innerHTML='<span class="binding-note">绑定状态读取失败。</span>'});
