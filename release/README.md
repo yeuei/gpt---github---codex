@@ -1,8 +1,6 @@
 # 发布与安装入口
 
-本仓库的 `trigger/` 是 Dashboard/runtime 唯一实现归属。Local Agent skill
-`local-agent-github-project-executor-v2` 是安装、调度和健康观测入口；协议模板仅
-提供通用文档与模板快照，不是运行时依赖，也不默认使用 git submodule。
+本仓库 `trigger/` 是 Dashboard/runtime 唯一实现归属；Local Agent skill 负责安装、调度和健康观测，基础协议仓库不作为 runtime submodule。
 
 ```text
 python /path/to/local-agent-github-project-executor-v2/scripts/dashboard_runtime.py \
@@ -11,9 +9,13 @@ python /path/to/local-agent-github-project-executor-v2/scripts/dashboard_runtime
   status --project-root /path/to/gpt---github---codex
 ```
 
-默认使用 `trigger/config.local.json`、`trigger/state.sqlite3` 和
-`127.0.0.1:8765`；可用 `--config`、`--db`、`--port` 覆盖。调度器应依据
-`status` 的 `reachable` 与 `/api/status` 内容判断健康。发布时记录协议模板的
-tag/commit 快照；项目专属 URL、profile、命令和 token 只能留在本机忽略配置。
+最低兼容面：
 
-最低兼容面：Python 3、`/api/status`、`/api/bindings` 与 binding.v1 状态机。
+- Python 3；
+- `/api/status`；
+- `/api/bindings` + binding.v1；
+- `/api/task/snapshot?pr=N&sha=<commit>` exact-SHA 历史任务；
+- `/api/refresh-github` 显式网络刷新；
+- 后台默认 local Git scan，无隐式 GitHub API/fetch 依赖。
+
+本机 `config.local.json`、`state.sqlite3`、浏览器 profile、conversation URL、Agent command 与 pairing token 不进入 Git。
