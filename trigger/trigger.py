@@ -17,6 +17,10 @@ import sqlite3
 import subprocess
 import threading
 import time
+import urllib.error
+import urllib.request
+import socket
+import signal
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from http import HTTPStatus
@@ -28,6 +32,7 @@ from urllib.parse import parse_qs, unquote, urlparse
 ROOT = Path(__file__).resolve().parent
 DEFAULT_CONFIG = ROOT / "config.local.json"
 DEFAULT_DB = ROOT / "state.sqlite3"
+GITHUB_CACHE = ROOT / "github_prs_cache.json"
 APPROVAL_DIR = ROOT / "approval-requests"
 ORIGIN_RE = re.compile(r"^Coordination-Origin:\s*(agent|chatgpt)\s*$", re.M | re.I)
 EVENT_RE = re.compile(r"^Coordination-Event-Id:\s*(\S+)\s*$", re.M | re.I)
@@ -42,7 +47,27 @@ def now() -> str:
 
 
 def run(args: list[str], cwd: Path | None = None, timeout: int = 30) -> str:
-    result = subprocess.run(args, cwd=cwd, text=True, capture_output=True, timeout=timeout)
+    process = subprocess.Popen(args, cwd=cwd, text=True, stdout=subprocess.PIPE,
+                               stderr=subprocess.PIPE, start_new_session=True)
+    try:
+        stdout, stderr = process.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        # Git may have spawned ssh/curl descendants; terminate the whole
+        # process group so timed-out polls cannot accumulate live transports.
+        try:
+            os.killpg(process.pid, signal.SIGTERM)
+        except (OSError, ProcessLookupError):
+            pass
+        try:
+            stdout, stderr = process.communicate(timeout=2)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except (OSError, ProcessLookupError):
+                pass
+            stdout, stderr = process.communicate()
+        raise subprocess.TimeoutExpired(args, timeout, output=stdout, stderr=stderr)
+    result = subprocess.CompletedProcess(args, process.returncode, stdout, stderr)
     if result.returncode:
         raise RuntimeError((result.stderr or result.stdout).strip())
     return result.stdout.strip()
@@ -345,6 +370,26 @@ class Store:
             updated = self.db.execute("select * from bindings where binding_id=?", (binding_id,)).fetchone()
         return {"ok": True, "status": "revoked", "binding": self._binding_public(updated)}
 
+    def connect_repository(self, data: dict[str, Any]) -> dict[str, Any]:
+        """Create/replace the single explicit whole-repository connection."""
+        timestamp = now()
+        with self.lock:
+            self._expire_bindings_locked(timestamp)
+            self.db.execute(
+                "update bindings set status='revoked', revoked_at=?, updated_at=? where repository=? and status='active'",
+                (timestamp, timestamp, data["repository"]),
+            )
+            binding_id = f"bind-{secrets.token_urlsafe(12)}"
+            self.db.execute(
+                "insert into bindings(binding_id,route_id,repository,branch,pr_number,web_conversation_id,web_conversation_title,status,created_at,confirmed_at,updated_at) values(?,?,?,?,?,?,?,?,?,?,?)",
+                (binding_id, data["route_id"], data["repository"], "*", 0,
+                 data["web_conversation_id"], data.get("web_conversation_title", ""), "active",
+                 timestamp, timestamp, timestamp),
+            )
+            self.db.commit()
+            row = self.db.execute("select * from bindings where binding_id=?", (binding_id,)).fetchone()
+        return {"ok": True, "status": "active", "binding": self._binding_public(row)}
+
 
 @dataclass
 class Commit:
@@ -381,6 +426,39 @@ class GitSource:
             return refs
         wanted = set(self.watch_branches)
         return [name for name in refs if name.removeprefix(f"{self.remote}/") in wanted]
+
+    def sync_remote_refs(self) -> list[str]:
+        """Refresh tracked remote branches without wildcard fetch/prune.
+
+        GitHub HTTPS occasionally stalls while negotiating a full repository
+        fetch. Listing heads is cheap; fetch each known branch directly so one
+        problematic ref cannot block the whole Dashboard poll.
+        """
+        # Use locally known remote branches first. This avoids the occasional
+        # GitHub HTTPS stall in ls-remote and still refreshes every branch the
+        # Dashboard is already watching. New branches are discovered by the
+        # authenticated PR API path or on the next successful sync.
+        branches = [name.removeprefix(f"{self.remote}/") for name in self.refs()]
+        if not branches:
+            try:
+                raw = run(["git", "ls-remote", "--heads", self.remote], self.repo, timeout=30)
+            except Exception as exc:
+                raise RuntimeError(f"远程分支列表获取失败（{self.remote}）：{exc}") from exc
+            for line in raw.splitlines():
+                parts = line.split()
+                if len(parts) == 2 and parts[1].startswith("refs/heads/"):
+                    branches.append(parts[1][len("refs/heads/"):])
+        errors = []
+        for branch in branches:
+            try:
+                run(["git", "fetch", self.remote,
+                     f"refs/heads/{branch}:refs/remotes/{self.remote}/{branch}",
+                     "--no-tags", "--quiet"], self.repo, timeout=30)
+            except Exception as exc:
+                errors.append(f"{self.remote}/{branch}: {exc}")
+        if errors:
+            raise RuntimeError("远程分支同步失败：" + "; ".join(errors)[:450])
+        return branches
 
     def poll(self, ref: str, cursor: str | None) -> tuple[str, list[Commit]]:
         head = run(["git", "rev-parse", ref], self.repo)
@@ -461,7 +539,21 @@ class OpenBrowserUse:
                 matching = [item for item in profiles if item.get("browser", "").lower() == browser and
                             (item.get("directory", "").lower() == profile or item.get("displayName", "").lower() == profile)]
                 if not matching:
-                    raise RuntimeError(f"未找到已连接的 Chrome 配置：{browser}/{self.chat.get('profile', 'Default')}")
+                    # In the supported Windows-OBU/SSH-RemoteForward setup,
+                    # the Linux host intentionally has no local Chrome profile
+                    # or OBU CLI. Probe the forwarded MCP TCP endpoint instead
+                    # and report that state explicitly rather than implying a
+                    # broken local browser.
+                    try:
+                        with socket.create_connection(("127.0.0.1", 17333), timeout=1.5):
+                            return {"state": "connected", "label": "远程 OBU MCP 隧道已连接", "checked_at": checked_at,
+                                    "target": "windows:chrome:Default", "detail": "Linux 未运行本地 profile；已检测到 SSH 转发的 Windows OBU MCP 端口"}
+                    except OSError:
+                        pass
+                    # Extension/native-host connectivity can be healthy even
+                    # when the CLI profile listing is empty in this shell.
+                    return {"state": "unknown", "label": "扩展已连接，CLI 未发现 profile", "checked_at": checked_at,
+                            "target": f"{browser}:{self.chat.get('profile', 'Default')}", "detail": "请在同一用户会话启动目标 Chrome profile 后重试"}
                 self._ping(self._common())
                 return {"state": "connected", "label": "已连接", "checked_at": checked_at,
                         "target": matching[0].get("target", f"{browser}:{profile}"), "detail": "OBU ping 成功"}
@@ -601,6 +693,46 @@ class OpenBrowserUse:
             # Keep the broker session alive for subsequent events. The trigger
             # is a long-running local service, not a one-shot browser turn.
 
+    def open_chatgpt(self) -> str:
+        """Open the configured ChatGPT conversation without editing or submitting."""
+        # Debug navigation is intentionally independent from event dispatch:
+        # an empty conversation_url opens the ChatGPT home page, while the
+        # dispatch path still requires an explicit conversation URL.
+        url = str(self.chat.get("conversation_url", "")).strip()
+        if "REPLACE_" in url or (url and not url.startswith("https://chatgpt.com/")):
+            raise RuntimeError("chatgpt.conversation_url must be a chatgpt.com URL")
+        url = url or "https://chatgpt.com/"
+        try:
+            with socket.create_connection(("127.0.0.1", 17333), timeout=2):
+                pass
+        except OSError as exc:
+            raise RuntimeError("Windows OBU MCP 隧道不可达（Linux 127.0.0.1:17333）；请确认 SSH RemoteForward 和 Windows Supergateway :7333 均已启动") from exc
+        endpoint = "http://127.0.0.1:17333/mcp"
+        headers = {"Content-Type": "application/json", "Accept": "application/json, text/event-stream"}
+        def mcp_post(payload: dict[str, Any], session: str | None = None) -> tuple[dict[str, str], str]:
+            h = dict(headers)
+            if session: h["Mcp-Session-Id"] = session
+            req = urllib.request.Request(endpoint, data=json.dumps(payload).encode(), headers=h, method="POST")
+            with urllib.request.urlopen(req, timeout=15) as response:
+                return dict(response.headers.items()), response.read().decode("utf-8")
+        init_headers, _ = mcp_post({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"dashboard","version":"1"}}})
+        session = init_headers.get("mcp-session-id") or init_headers.get("Mcp-Session-Id")
+        if not session: raise RuntimeError("MCP 初始化未返回会话 ID")
+        # Inspect existing tabs first. The dashboard must not create a second
+        # ChatGPT tab when OBU already controls one for this target.
+        _, tabs_body = mcp_post({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"user_tabs","arguments":{}}}, session)
+        if url:
+            try:
+                tabs_payload = json.loads(tabs_body)
+                tabs_text = tabs_payload.get("result", {}).get("content", [{}])[0].get("text", "")
+                if url in tabs_text:
+                    return "已存在由 Open Browser Use 接管的 ChatGPT 页面，未新建标签页"
+            except (ValueError, TypeError, AttributeError, IndexError):
+                pass
+        _, body = mcp_post({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"open_tab","arguments":{"url":url}}}, session)
+        if '"error"' in body: raise RuntimeError(body[:500])
+        return "已通过 Windows OBU MCP 打开 ChatGPT"
+
 
 def parse_task_markdown(content: str) -> dict[str, Any]:
     """Parse only explicit Markdown task checkboxes; status legend text is ignored."""
@@ -648,6 +780,166 @@ class Service:
         self.browser_status: dict[str, Any] = {"state": "unknown", "label": "未检测", "checked_at": None,
                                                "target": f"{self.browser.chat.get('browser', 'chrome')}:{self.browser.chat.get('profile', 'Default')}",
                                                "detail": "尚未执行连接检测"}
+        self._github_lock = threading.Lock()
+        self._github_cache: tuple[float, list[dict[str, Any]], str] = (0.0, [], "")
+        self._last_git_sync = 0.0
+        self._git_sync_interval = 60.0
+
+    def github_prs(self, force: bool = False) -> dict[str, Any]:
+        """Read cloud PR history without requiring a local event record.
+
+        The result is cached briefly so dashboard polling does not hammer the
+        GitHub API. Credentials, when configured locally, are never returned.
+        """
+        with self._github_lock:
+            timestamp, cached, error = self._github_cache
+            if force:
+                try:
+                    self.git.sync_remote_refs()
+                    local = self._local_pr_history()
+                    self._github_cache = (time.monotonic(), local, "")
+                    return {"prs": local, "error": "", "source": "local-git-refresh"}
+                except Exception as exc:
+                    error = f"本地 Git 刷新失败：{exc}"[:500]
+                    fallback = cached or self._local_pr_history()
+                    self._github_cache = (time.monotonic(), fallback, error)
+                    return {"prs": fallback, "error": error, "source": "local-git-cache"}
+            if not force:
+                local = self._local_pr_history()
+                if local:
+                    self._github_cache = (time.monotonic(), local, "")
+                    return {"prs": local, "error": "", "source": "local-git"}
+            if not force and time.monotonic() - timestamp < 30:
+                return {"prs": cached, "error": error, "source": "github-api"}
+            repository = str(self.config.get("repository", ""))
+            if not re.fullmatch(r"[^/\\s]+/[^/\\s]+", repository):
+                error = "repository 配置不是 owner/name"
+                self._github_cache = (time.monotonic(), [], error)
+                return {"prs": [], "error": error, "source": "github-api"}
+            cli = str(self.config.get("github", {}).get("cli", "gh")) if isinstance(self.config.get("github"), dict) else "gh"
+            try:
+                raw_prs = run([cli, "api", f"repos/{repository}/pulls", "-f", "state=all", "-f", "per_page=100", "-f", "sort=updated", "-f", "direction=desc"], self.git.repo, timeout=15)
+                payload = json.loads(raw_prs)
+                auth_source = "local-gh"
+            except (OSError, RuntimeError, ValueError) as cli_exc:
+                auth_source = "github-api"
+                url = f"https://api.github.com/repos/{repository}/pulls?state=all&per_page=100&sort=updated&direction=desc"
+                request = urllib.request.Request(url, headers={"Accept": "application/vnd.github+json", "User-Agent": "local-agent-dashboard"})
+                token = self.config.get("github", {}).get("token") if isinstance(self.config.get("github"), dict) else None
+                if isinstance(token, str) and token.strip():
+                    request.add_header("Authorization", f"Bearer {token.strip()}")
+                try:
+                    with urllib.request.urlopen(request, timeout=8) as response:
+                        payload = json.loads(response.read().decode("utf-8"))
+                except (OSError, ValueError, urllib.error.URLError) as exc:
+                    error = f"本机 gh api 不可用（{cli_exc}）；GitHub API 也不可用：{exc}"[:500]
+                    self._github_cache = (time.monotonic(), cached, error)
+                    fallback = cached or self._local_pr_history()
+                    self._github_cache = (time.monotonic(), fallback, error)
+                    return {"prs": fallback, "error": error, "source": "local-cache" if fallback else "github-api"}
+            try:
+                if not isinstance(payload, list):
+                    raise RuntimeError("GitHub PR API returned an invalid payload")
+                prs = []
+                for item in payload:
+                    if not isinstance(item, dict) or not isinstance(item.get("number"), int):
+                        continue
+                    head, base = item.get("head") or {}, item.get("base") or {}
+                    merged_at = item.get("merged_at")
+                    state = "merged" if merged_at else str(item.get("state") or "unknown")
+                    commits: list[dict[str, Any]] = []
+                    commits_url = f"https://api.github.com/repos/{repository}/pulls/{item['number']}/commits?per_page=100"
+                    commit_request = urllib.request.Request(commits_url, headers={"Accept": "application/vnd.github+json", "User-Agent": "local-agent-dashboard"})
+                    if isinstance(token, str) and token.strip():
+                        commit_request.add_header("Authorization", f"Bearer {token.strip()}")
+                    try:
+                        if auth_source == "local-gh":
+                            commit_payload = json.loads(run([cli, "api", f"repos/{repository}/pulls/{item['number']}/commits", "-f", "per_page=100"], self.git.repo, timeout=15))
+                        else:
+                            with urllib.request.urlopen(commit_request, timeout=8) as commit_response:
+                                commit_payload = json.loads(commit_response.read().decode("utf-8"))
+                        for commit_item in commit_payload if isinstance(commit_payload, list) else []:
+                            commit = commit_item.get("commit") or {}
+                            message = str(commit.get("message") or "")
+                            origin_match = ORIGIN_RE.search(message)
+                            event_match = EVENT_RE.search(message)
+                            cause_match = CAUSE_RE.search(message)
+                            author = commit.get("author") or {}
+                            commits.append({"sha": str(commit_item.get("sha") or ""),
+                                            "subject": message.splitlines()[0] if message else "提交",
+                                            "message": message,
+                                            "origin": origin_match.group(1).lower() if origin_match else "github",
+                                            "event_key": event_match.group(1) if event_match else f"github:{item['number']}:{str(commit_item.get('sha') or '')[:12]}",
+                                            "caused_by": cause_match.group(1) if cause_match else None,
+                                            "observed_at": str(author.get("date") or commit.get("committer", {}).get("date") or item.get("updated_at") or "")})
+                    except (OSError, ValueError, urllib.error.URLError):
+                        commits = []
+                    prs.append({"number": item["number"], "title": str(item.get("title") or ""),
+                                "state": state, "draft": bool(item.get("draft")),
+                                "html_url": str(item.get("html_url") or ""),
+                                "updated_at": str(item.get("updated_at") or item.get("created_at") or ""),
+                                "created_at": str(item.get("created_at") or ""), "merged_at": merged_at,
+                                "head": {"ref": str(head.get("ref") or ""), "sha": str(head.get("sha") or "")},
+                                "base": {"ref": str(base.get("ref") or "")}, "commits": commits})
+                try:
+                    tmp = GITHUB_CACHE.with_suffix('.tmp')
+                    tmp.write_text(json.dumps(prs, ensure_ascii=False), encoding='utf-8')
+                    tmp.replace(GITHUB_CACHE)
+                except OSError:
+                    pass
+                self._github_cache = (time.monotonic(), prs, "")
+                return {"prs": prs, "error": "", "source": auth_source}
+            except (OSError, ValueError, RuntimeError, urllib.error.URLError) as exc:
+                error = str(exc)[:500]
+                disk_cached = cached
+                try:
+                    disk_cached = json.loads(GITHUB_CACHE.read_text(encoding="utf-8"))
+                    if not isinstance(disk_cached, list): disk_cached = cached
+                except (OSError, ValueError, TypeError):
+                    pass
+                if not disk_cached:
+                    disk_cached = self._local_pr_history()
+                self._github_cache = (time.monotonic(), disk_cached, error)
+                return {"prs": disk_cached, "error": error, "source": "local-cache" if disk_cached else "github-api"}
+
+    def _local_pr_history(self) -> list[dict[str, Any]]:
+        """Rebuild PR commit nodes from fetched local PR branches as a resilient fallback."""
+        result = []
+        branches = []
+        try:
+            branches = [name.removeprefix(f"{self.git.remote}/") for name in self.git.refs()]
+        except (OSError, RuntimeError):
+            branches = []
+        for branch in branches:
+            try:
+                shas = run(["git", "rev-list", "--reverse", f"{self.git.remote}/{branch}"], self.git.repo, timeout=15).splitlines()
+            except (OSError, RuntimeError):
+                continue
+            commits = []
+            numbers = set()
+            for sha in shas:
+                try:
+                    message = run(["git", "show", "-s", "--format=%B", sha], self.git.repo)
+                    stamp = run(["git", "show", "-s", "--format=%cI", sha], self.git.repo)
+                except (OSError, RuntimeError):
+                    continue
+                origin_match, event_match, cause_match = ORIGIN_RE.search(message), EVENT_RE.search(message), CAUSE_RE.search(message)
+                try:
+                    tree = run(["git", "ls-tree", "-r", "--name-only", sha], self.git.repo, timeout=10)
+                    numbers.update(int(match.group(1)) for match in re.finditer(r"coordination/PR-([1-9][0-9]*)/任务\.md$", tree, re.MULTILINE))
+                except (OSError, RuntimeError, ValueError):
+                    pass
+                commits.append({"sha": sha, "subject": message.splitlines()[0] if message else "提交", "message": message,
+                                "origin": origin_match.group(1).lower() if origin_match else "github", "event_key": event_match.group(1) if event_match else f"local:{branch}:{sha[:12]}",
+                                "caused_by": cause_match.group(1) if cause_match else None, "observed_at": stamp})
+            number = min(numbers) if len(numbers) == 1 else None
+            if number is None:
+                number_match = re.search(r"(?:^|[-_/])pr[-_]?([1-9][0-9]*)(?:$|[-_/])", branch, re.IGNORECASE)
+                number = int(number_match.group(1)) if number_match else 0
+            result.append({"number": number, "title": f"PR #{number}（本地历史回退）" if number else f"本地分支：{branch}", "state": "unknown", "draft": False, "html_url": "",
+                           "updated_at": commits[-1]["observed_at"] if commits else "", "created_at": commits[0]["observed_at"] if commits else "", "merged_at": None,
+                           "head": {"ref": branch, "sha": commits[-1]["sha"] if commits else ""}, "base": {"ref": "main"}, "commits": commits})
+        return result
 
     def check_browser(self) -> dict[str, Any]:
         self.browser_status = self.browser.check_connection()
@@ -703,6 +995,19 @@ class Service:
                                           "web_conversation_title": title, "token": token,
                                           "token_hash": hashlib.sha256(token.encode()).hexdigest(), "expires_at": expires})
 
+    def connect_repository(self, payload: dict[str, Any]) -> dict[str, Any]:
+        try:
+            repository = self._text_field(payload, "repository", 1, 200)
+            conversation_id = self._text_field(payload, "web_conversation_id", 1, 200)
+            title = self._text_field(payload, "web_conversation_title", 0, 200) if payload.get("web_conversation_title") else ""
+            route_id = self._text_field(payload, "route_id", 1, 200) if payload.get("route_id") else f"repo:{repository}"
+            if repository != self.config.get("repository"):
+                raise ValueError("repository 必须匹配当前配置仓库")
+        except ValueError as exc:
+            return {"ok": False, "status": "invalid", "error": str(exc)}
+        return self.store.connect_repository({"repository": repository, "web_conversation_id": conversation_id,
+                                              "web_conversation_title": title, "route_id": route_id})
+
     def claim_binding(self, payload: dict[str, Any]) -> dict[str, Any]:
         try:
             binding_id = self._text_field(payload, "binding_id", 8, 128)
@@ -748,7 +1053,9 @@ class Service:
         branch = str(event.get("ref") or "").removeprefix(f"{self.git.remote}/")
         pr_number = event.get("pr_number")
         matches = [item for item in self.store.list_bindings(str(self.config.get("repository", "")))
-                   if item.get("status") == "active" and item.get("branch") == branch and item.get("pr_number") == pr_number]
+                   if item.get("status") == "active" and
+                   ((item.get("branch") == branch and item.get("pr_number") == pr_number) or
+                    (item.get("branch") == "*" and item.get("pr_number") == 0))]
         return matches[0] if len(matches) == 1 else None
 
     def task_document(self, pr_number: int | None = None) -> dict[str, Any]:
@@ -831,6 +1138,18 @@ class Service:
         current = self.task_document(pr_number)
         return {"ok": True, "path": relative.as_posix(), "pr_number": pr_number, "current": current,
                 "snapshots": snapshots, "history_count": len(snapshots)}
+
+    def task_at_commit(self, pr_number: int, commit_sha: str) -> dict[str, Any]:
+        """Read the task file from the exact commit, never the current tree."""
+        if not isinstance(pr_number, int) or pr_number < 1 or not re.fullmatch(r"[0-9a-fA-F]{7,64}", commit_sha or ""):
+            return {"ok": False, "error": "invalid PR number or commit SHA"}
+        relative = f"coordination/PR-{pr_number}/任务.md"
+        try:
+            content = run(["git", "show", f"{commit_sha}:{relative}"], self.git.repo, timeout=10)
+        except Exception:
+            return {"ok": False, "historical_unavailable": True, "error": "该 commit 中没有可读取的任务.md 历史快照"}
+        return {"ok": True, "pr_number": pr_number, "path": relative,
+                "commit_sha": commit_sha, "content": content, **parse_task_markdown(content)}
 
     def set_auto_mode(self, enabled: bool) -> dict[str, Any]:
         """Set the explicit unattended mode and drain existing approvals.
@@ -931,8 +1250,9 @@ class Service:
             self.store.finish(event_key, "needs human", str(exc))
 
     def poll_once(self) -> dict[str, Any]:
+        # Background polling is intentionally local-only. Remote GitHub sync is
+        # performed only by the explicit dashboard refresh action.
         try:
-            run(["git", "fetch", self.git.remote, "--prune", "--quiet"], self.git.repo)
             observed = []
             for ref in self.git.refs():
                 head, commits = self.git.poll(ref, self.store.cursor(ref))
@@ -941,7 +1261,7 @@ class Service:
                 self.store.set_cursor(ref, head)
                 observed.append({"ref": ref, "commits": len(commits), "head": head})
             self.last_error = ""
-            return {"refs": observed, "commits": sum(item["commits"] for item in observed)}
+            return {"refs": observed, "commits": sum(item["commits"] for item in observed), "source": "local-git"}
         except Exception as exc:
             self.last_error = str(exc)
             return {"error": self.last_error}
@@ -961,7 +1281,7 @@ const esc=v=>String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&
 const label={enabled:'总开关',agent_to_chatgpt:'Agent → ChatGPT',chatgpt_to_agent:'ChatGPT → Agent'};
 const description={enabled:'暂停时只记录已跳过的事件。',agent_to_chatgpt:'控制本地 Agent 唤醒 ChatGPT Web。',chatgpt_to_agent:'控制 ChatGPT 更新启动已配置的本地 Agent。'};
 const status={detected:'已发现','awaiting approval':'等待审批',dispatched:'已执行','needs human':'需要人工处理','skipped: paused':'已跳过：总开关暂停','skipped: agent_to_chatgpt disabled':'已跳过：Agent → ChatGPT 已关闭','skipped: chatgpt_to_agent disabled':'已跳过：ChatGPT → Agent 已关闭'};
-const origin={agent:'本地 Agent',chatgpt:'远程 ChatGPT'};
+const origin={agent:'本地 Agent',chatgpt:'远程 ChatGPT',github:'未知来源（无 Coordination-Origin）'};
 let latest=null, eventFilter='all', lastStatusFingerprint='';
 const preserveScrollSelector='#canvas-detail,#canvas-viewport,#task-document-raw';
 const captureScrollPosition=()=>{const root=document.scrollingElement||document.documentElement,pageMax=Math.max(0,root.scrollHeight-window.innerHeight);return {pageX:window.scrollX,pageY:window.scrollY,pageMax,atBottom:window.scrollY>=pageMax-8,targets:[...document.querySelectorAll(preserveScrollSelector)].map((element,index)=>{const max=Math.max(0,element.scrollHeight-element.clientHeight);return {key:element.id||element.className||String(index),left:element.scrollLeft,top:element.scrollTop,max,atBottom:element.scrollTop>=max-8}})}};
@@ -970,18 +1290,22 @@ window.addEventListener('scroll',()=>{if(!restoringScroll)lastUserScrollAt=perfo
 const restoreScrollPosition=state=>{if(!state||performance.now()-lastUserScrollAt<700)return;requestAnimationFrame(()=>{if(performance.now()-lastUserScrollAt<700)return;restoringScroll=true;const root=document.scrollingElement||document.documentElement,max=Math.max(0,root.scrollHeight-window.innerHeight),pageY=state.atBottom?max:Math.min(state.pageY,max);window.scrollTo(state.pageX,pageY);state.targets.forEach(saved=>{const element=document.getElementById(saved.key)||document.querySelector('.'+String(saved.key).split(' ').join('.'));if(element){const currentMax=Math.max(0,element.scrollHeight-element.clientHeight);element.scrollLeft=saved.left;element.scrollTop=saved.atBottom?currentMax:Math.min(saved.top,currentMax)}});requestAnimationFrame(()=>{restoringScroll=false})})};
 const notice=message=>{const box=document.querySelector('#notice');box.textContent=message||'';box.style.display=message?'block':'none'};
 async function api(path,options={}){const response=await fetch(path,options);let data={};try{data=await response.json()}catch(_){}if(!response.ok)throw new Error(data.error||'请求失败');return data}
+const githubCacheKey='local-agent-dashboard:github-prs:v1';
+const saveGithubCache=data=>{try{if(data?.github_prs?.prs?.length)localStorage.setItem(githubCacheKey,JSON.stringify({saved_at:new Date().toISOString(),github_prs:data.github_prs}))}catch(_){}};
+const loadGithubCache=()=>{try{const item=JSON.parse(localStorage.getItem(githubCacheKey)||'null');return item?.github_prs||null}catch(_){return null}};
+async function refreshGithub(){const button=window.__githubRefreshButton;if(button?.disabled)return;if(button){button.disabled=true;button.dataset.previousLabel=button.textContent;button.textContent='同步中…';button.setAttribute('aria-busy','true')}try{const data=await api('/api/status?refresh=1');saveGithubCache(data);latest=data;renderEvents(data);notice(data.github_prs?.error||'已从 GitHub 刷新 PR/commit 历史。')}catch(error){notice('GitHub 刷新失败：'+error.message)}finally{if(button){button.disabled=false;button.textContent=button.dataset.previousLabel||'从 GitHub 刷新';button.removeAttribute('aria-busy')}}}
 async function set(k,v){try{await api('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({key:k,value:v})});notice('')}catch(error){notice('无法更新“'+label[k]+'”：'+error.message)}await load()}
 async function setMode(v){try{const data=await api('/api/mode',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({auto:v})});notice(v?'自动审批模式已开启；已处理 '+data.drained_event_keys.length+' 个符合条件的事件。':'已恢复逐条审批和填入草稿模式。')}catch(error){notice('切换自动审批模式失败：'+error.message)}await load()}
 async function poll(){try{const data=await api('/api/poll',{method:'POST'});if(data.error)notice('GitHub 检查失败：'+data.error);else notice('已检查 GitHub；发现 '+data.commits+' 个新提交。')}catch(error){notice('GitHub 检查失败：'+error.message)}await load()}
 async function approve(key){try{await api('/api/approve/'+encodeURIComponent(key),{method:'POST'});notice('事件已提交给触发器处理。')}catch(error){notice('无法处理此事件：'+error.message)}await load()}
 async function checkBrowser(){const box=document.querySelector('#browser');box.textContent='浏览器连接：检测中…';try{renderBrowser(await api('/api/browser/check',{method:'POST'}))}catch(error){notice('浏览器连接检测失败：'+error.message)}}
-function renderBrowser(browser){document.querySelector('#browser').innerHTML=`<span class="health ${esc(browser.state)}">● ${esc(browser.label)}</span><span class="pill">${esc(browser.target||'未配置')}</span><span class="detail">${esc(browser.detail||'')} ${browser.checked_at?'（'+esc(browser.checked_at)+'）':''}</span><button id="check-browser">检测浏览器连接</button>`;document.querySelector('#check-browser').addEventListener('click',checkBrowser)}
+function renderBrowser(browser){document.querySelector('#browser').innerHTML=`<span class="health ${esc(browser.state)}">● ${esc(browser.label)}</span><span class="pill">${esc(browser.target||'未配置')}</span><span class="detail">${esc(browser.detail||'')} ${browser.checked_at?'（'+esc(browser.checked_at)+'）':''}</span><button id="open-chatgpt-debug">调试：打开 ChatGPT</button><button id="check-browser">检测浏览器连接</button>`;document.querySelector('#check-browser').addEventListener('click',checkBrowser);document.querySelector('#open-chatgpt-debug').addEventListener('click',async()=>{const b=document.querySelector('#open-chatgpt-debug');b.disabled=true;b.textContent='打开中…';try{const r=await api('/api/browser/open-chatgpt',{method:'POST'});notice(r.message||r.error||'调试操作完成')}catch(e){notice('调试打开 ChatGPT 失败：'+e.message)}finally{b.disabled=false;b.textContent='调试：打开 ChatGPT'}})}
 function tone(event){if(event.status==='dispatched')return 'ok';if(event.status==='needs human')return 'danger';return 'warn'}
 function visibleEvents(events){return events.filter(event=>eventFilter==='all'||eventFilter==='action'&&['awaiting approval','needs human'].includes(event.status)||eventFilter==='pending'&&event.status==='awaiting approval'||eventFilter==='human'&&event.status==='needs human'||eventFilter==='done'&&event.status==='dispatched')}
 function renderEvents(data){const events=visibleEvents(data.events), pending=data.events.filter(e=>e.status==='awaiting approval').length, human=data.events.filter(e=>e.status==='needs human').length;document.querySelector('#event-summary').innerHTML=`<span class="summary"><span class="pill">共 ${data.events.length} 个</span><span class="pill ${pending?'warn':'good'}">${pending} 个等待审批</span><span class="pill ${human?'danger':'good'}">${human} 个需要人工处理</span></span>`;const body=document.querySelector('#events');if(!events.length){body.innerHTML='<tr><td class="empty" colspan="6">当前筛选条件下没有事件。</td></tr>';return}body.innerHTML=events.map(event=>{const retry=['awaiting approval','needs human'].includes(event.status),eventId=esc(event.event_key),causedBy=event.caused_by?'<div class="event-meta">由 '+esc(event.caused_by)+' 引起</div>':'';return `<tr><td>${esc(event.observed_at)}</td><td>${event.pr_number==null?'<span class="pill">未关联</span>':'<span class="pill">#'+esc(event.pr_number)+'</span>'}</td><td>${esc(origin[event.origin]||event.origin)}</td><td><strong>${esc(event.sha.slice(0,8))}</strong><div>${esc(event.subject)}</div><div class="event-meta">${eventId}</div><div class="event-meta">${esc(event.ref||'')}</div>${causedBy}</td><td class="status status-${tone(event)}">${esc(status[event.status]||event.status)}</td><td>${esc(event.detail||'—')}${retry?`<br><button class="event-action ${event.status==='needs human'?'danger':'primary'}" data-event-key="${eventId}">${event.status==='needs human'?'修复后重试':'批准此事件'}</button>`:''}</td></tr>`}).join('');body.querySelectorAll('[data-event-key]').forEach(button=>button.addEventListener('click',()=>approve(button.dataset.eventKey)))}
 function renderControls(data){const settings=data.settings,controls=document.querySelector('#controls');controls.innerHTML=`<div class="mode"><div><button id="auto-mode" class="${data.auto_mode?'on':'off'}">${data.auto_mode?'✓ 自动审批模式：已开启':'○ 自动审批模式：已关闭'}</button><div class="mode-copy">${data.auto_mode?'新事件和现有等待审批事件会自动处理；已验证的草稿可提交一次。':'安全模式：每条事件需要单独批准，ChatGPT 消息默认只填入草稿。'}</div></div><span class="pill ${data.auto_mode?'warn':'good'}">${data.auto_mode?'会自动发送':'逐条审批'}</span></div><div class="toggle-grid">${['enabled','agent_to_chatgpt','chatgpt_to_agent'].map(key=>`<button class="toggle ${settings[key]?'on':'off'}" data-setting="${key}"><strong>${settings[key]?'✓ 已开启':'○ 已关闭'}：${label[key]}</strong><small>${description[key]}</small></button>`).join('')}</div>`;controls.querySelector('#auto-mode').addEventListener('click',()=>setMode(!data.auto_mode));controls.querySelectorAll('[data-setting]').forEach(button=>button.addEventListener('click',()=>set(button.dataset.setting,!settings[button.dataset.setting])))}
-const statusFingerprint=data=>JSON.stringify({events:data.events,settings:data.settings,browser:{state:data.browser?.state,label:data.browser?.label,target:data.browser?.target,detail:data.browser?.detail},repository:data.repository,auto_mode:data.auto_mode,last_error:data.last_error});
-async function load(){try{const data=await api('/api/status'),fingerprint=statusFingerprint(data),changed=fingerprint!==lastStatusFingerprint,scrollState=changed?captureScrollPosition():null;latest=data;if(changed){renderBrowser(data.browser);renderControls(data);renderEvents(data);lastStatusFingerprint=fingerprint;restoreScrollPosition(scrollState)}document.querySelector('#last-update').textContent='页面刷新于 '+new Date().toLocaleTimeString();if(data.last_error)notice('后台轮询错误：'+data.last_error)}catch(error){notice('无法读取 Dashboard 状态：'+error.message)}}
+const statusFingerprint=data=>JSON.stringify({events:data.events,github_prs:data.github_prs,settings:data.settings,browser:{state:data.browser?.state,label:data.browser?.label,target:data.browser?.target,detail:data.browser?.detail},repository:data.repository,auto_mode:data.auto_mode,last_error:data.last_error});
+async function load(){try{const data=await api('/api/status');if(!data.github_prs?.prs?.length){const cached=loadGithubCache();if(cached)data.github_prs={...cached,error:data.github_prs?.error||'当前使用浏览器缓存'};}saveGithubCache(data);const fingerprint=statusFingerprint(data),changed=fingerprint!==lastStatusFingerprint,scrollState=changed?captureScrollPosition():null;latest=data;if(changed){renderBrowser(data.browser);renderControls(data);renderEvents(data);lastStatusFingerprint=fingerprint;restoreScrollPosition(scrollState)}document.querySelector('#last-update').textContent='页面刷新于 '+new Date().toLocaleTimeString();if(data.last_error)notice('后台轮询错误：'+data.last_error)}catch(error){const cached=loadGithubCache();if(cached&&latest){latest.github_prs=cached;renderEvents(latest);notice('无法读取最新状态；当前显示浏览器缓存的 PR 历史。')}else notice('无法读取 Dashboard 状态：'+error.message)}}
 document.querySelector('#poll-now').addEventListener('click',poll);document.querySelector('#event-filter').addEventListener('change',event=>{eventFilter=event.target.value;if(latest)renderEvents(latest)});load();setInterval(load,5000);
 </script>"""
 HTML += """<script>
@@ -1010,30 +1334,34 @@ function prepareRichDashboard(){if(document.querySelector('#repository-card'))re
 function renderRepository(repository){const item=repository||{},name=document.querySelector('#repository-name'),meta=document.querySelector('#repository-meta'),mode=document.querySelector('#repository-mode');if(!name)return;name.textContent=item.name||'未命名交接仓库';meta.innerHTML=`<span class="pill">remote: ${esc(item.remote||'未配置')}</span><span class="pill">${esc(item.watch_branches||'未配置')}</span><span class="pill">${esc(item.local_path||'本地路径未知')}</span>`;mode.textContent=item.can_switch_live?'可切换':'单仓库配置'}
 function timelineGroups(events){const groups=new Map();for(const event of events){const key=event.pr_number==null?'unassigned':String(event.pr_number);if(!groups.has(key))groups.set(key,[]);groups.get(key).push(event)}return [...groups.entries()]}
 function renderTimeline(data){const cards=document.querySelector('#timeline-cards'),subtitle=document.querySelector('#timeline-subtitle'),summary=document.querySelector('#timeline-summary');if(!cards)return;const groups=timelineGroups(visibleEvents(data.events));const waiting=data.events.filter(event=>event.status==='awaiting approval').length,human=data.events.filter(event=>event.status==='needs human').length;summary.textContent=`${groups.length} 个 PR · ${waiting+human} 项需要关注`;subtitle.textContent=groups.length?'按最近活动排序；点击任意卡片展开事件、提交与审批操作。':'当前筛选条件下没有可展示的 PR 交接事件。';if(!groups.length){cards.innerHTML='<div class="timeline-empty">当前筛选条件下没有交接事件。</div>';return}cards.innerHTML=groups.map(([key,events],index)=>{const latestEvent=events[0],pending=events.some(event=>event.status==='awaiting approval'),needsHuman=events.some(event=>event.status==='needs human'),stage=needsHuman?'需要人工处理':pending?'等待审批':status[latestEvent.status]||latestEvent.status,stageClass=needsHuman?'danger':pending?'warn':'good',title=key==='unassigned'?'未关联 PR':'PR #'+key,detailId='timeline-detail-'+index;const details=events.map(event=>{const retry=['awaiting approval','needs human'].includes(event.status),eventId=esc(event.event_key),cause=event.caused_by?' · 由 '+esc(event.caused_by)+' 引起':'';return `<div class="timeline-event"><div><div class="timeline-event-title">${esc(event.subject)}</div><div class="timeline-event-copy">${esc(event.observed_at)} · ${esc(origin[event.origin]||event.origin)} · ${esc(event.sha.slice(0,8))}</div><div class="timeline-event-copy">Event ID: ${eventId}${cause}</div><div class="timeline-event-copy">${esc(event.ref||'未记录分支')} · ${esc(event.detail||'暂无详情')}</div></div><div class="timeline-event-actions"><span class="pill ${event.status==='needs human'?'danger':event.status==='awaiting approval'?'warn':'good'}">${esc(status[event.status]||event.status)}</span>${retry?`<br><button class="event-action ${event.status==='needs human'?'danger':'primary'}" data-event-key="${eventId}">${event.status==='needs human'?'修复后重试':'批准此事件'}</button>`:''}</div></div>`}).join('');return `<article class="timeline-card"><button type="button" class="timeline-summary" aria-expanded="false" aria-controls="${detailId}" data-timeline-card="${index}"><span class="timeline-number">${index+1}</span><span><span class="timeline-title">${title}</span><span class="timeline-brief">${esc(latestEvent.subject)} · ${events.length} 个事件</span></span><span><span class="pill ${stageClass}">${stage}</span><span class="timeline-chevron" aria-hidden="true">⌄</span></span></button><div id="${detailId}" class="timeline-detail" hidden>${details}</div></article>`}).join('');cards.querySelectorAll('[data-timeline-card]').forEach(button=>button.addEventListener('click',()=>{const card=button.closest('.timeline-card'),detail=document.getElementById(button.getAttribute('aria-controls')),expanded=button.getAttribute('aria-expanded')==='true';button.setAttribute('aria-expanded',String(!expanded));detail.hidden=expanded;card.classList.toggle('expanded',!expanded)}));cards.querySelectorAll('[data-event-key]').forEach(button=>button.addEventListener('click',event=>{event.stopPropagation();approve(button.dataset.eventKey)}))}
-prepareRichDashboard();const baseRenderEvents=renderEvents;const baseRenderTimeline=renderTimeline;const timelineCardKey=card=>card.querySelector('.timeline-title')?.textContent||'';renderTimeline=data=>{const cards=document.querySelector('#timeline-cards'),expanded=new Set([...cards?.querySelectorAll('.timeline-card')||[]].filter(card=>card.classList.contains('expanded')).map(timelineCardKey));baseRenderTimeline(data);cards?.querySelectorAll('.timeline-card').forEach(card=>{if(!expanded.has(timelineCardKey(card)))return;const button=card.querySelector('.timeline-summary'),detail=card.querySelector('.timeline-detail');button.setAttribute('aria-expanded','true');detail.hidden=false;card.classList.add('expanded')})};renderEvents=data=>{baseRenderEvents(data);renderRepository(data.repository);renderTimeline(data)};if(latest)renderEvents(latest);
+prepareRichDashboard();const baseRenderEvents=renderEvents;const baseRenderTimeline=renderTimeline;const timelineCardKey=card=>card.querySelector('.timeline-title')?.textContent||'';renderTimeline=data=>{const cards=document.querySelector('#timeline-cards'),expanded=new Set([...cards?.querySelectorAll('.timeline-card')||[]].filter(card=>card.classList.contains('expanded')).map(timelineCardKey));baseRenderTimeline(data);cards?.querySelectorAll('.timeline-card').forEach(card=>{if(!expanded.has(timelineCardKey(card)))return;const button=card.querySelector('.timeline-summary'),detail=card.querySelector('.timeline-detail');button.setAttribute('aria-expanded','true');detail.hidden=false;card.classList.add('expanded')})};renderEvents=data=>{if(window.__v3Active)return;baseRenderEvents(data);renderRepository(data.repository);renderTimeline(data)};if(latest)renderEvents(latest);
 </script></html>"""
 
 # Canvas layer: the existing API/data model stays unchanged; this replaces the
 # presentation of the PR timeline with a pannable, zoomable event canvas.
 HTML += """<style>
 #control-deck{position:sticky;top:12px;z-index:20;display:grid;gap:10px;padding:14px 16px;margin:16px 0;background:rgba(255,255,255,.86);border:1px solid #dbe4f0;border-radius:22px;box-shadow:0 16px 36px rgba(41,57,86,.11);backdrop-filter:blur(18px)}.control-deck-heading{display:flex;justify-content:space-between;align-items:flex-start;gap:16px}.control-deck-heading h2{margin:0;font-size:18px}.control-deck-heading p{margin:4px 0 0;color:#68758b;font-size:13px}.control-deck-heading .pill{white-space:nowrap}.control-deck-section{border-top:1px solid #e6ebf3;padding-top:10px}.control-deck-section.panel{margin:0!important;border:0!important;border-radius:0!important;padding:0!important;background:transparent!important;box-shadow:none!important;backdrop-filter:none!important}.control-deck #repository-card{margin:0;padding:4px 0 10px;box-shadow:none;border:0!important;background:transparent!important;border-radius:0}.control-deck #repository-card .repo-guidance{background:#f7f9fd;border-radius:12px;padding:10px 12px}.control-deck #browser{padding:0 0 3px}.control-deck #controls{padding:0}.control-deck .panel-heading{margin-bottom:7px}.control-deck .panel-heading h2{font-size:14px;color:#68758b}.control-deck .panel-heading #last-update{font-size:11px}.control-deck .toggle-grid{grid-template-columns:repeat(3,minmax(130px,1fr))}.control-deck .mode{margin-bottom:8px}.control-deck .approvals{margin:10px 0 0!important}.canvas-toolbar{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;margin-bottom:14px}.canvas-toolbar h2{margin:0;font-size:19px}.canvas-toolbar p{margin:3px 0 0;color:#68758b;font-size:13px}.canvas-actions{display:flex;align-items:center;gap:7px;flex-wrap:wrap}.canvas-actions label{color:#68758b;font-size:13px}.canvas-actions select{min-width:150px}.canvas-actions button{min-width:38px}.canvas-zoom{display:inline-flex;align-items:center;gap:5px;padding:3px;border:1px solid #dce5f1;border-radius:10px;background:#fff}.canvas-zoom button{padding:5px 9px;border:0!important;box-shadow:none!important}.canvas-zoom output{min-width:45px;text-align:center;color:#68758b;font-size:12px}.canvas-layout{display:grid;grid-template-columns:minmax(0,1fr) 300px;gap:14px;align-items:stretch}.canvas-viewport{position:relative;min-height:540px;overflow:hidden;border:1px solid #dbe4f0;border-radius:17px;background:radial-gradient(circle,#d9e4f3 1px,transparent 1px),#f8fafd;background-size:22px 22px;cursor:grab;touch-action:none;outline:none}.canvas-viewport:focus-visible{box-shadow:0 0 0 3px rgba(39,110,241,.2)}.canvas-viewport.is-dragging{cursor:grabbing}.canvas-world{position:absolute;left:0;top:0;transform-origin:0 0;will-change:transform}.canvas-edges{position:absolute;left:0;top:0;overflow:visible;pointer-events:none}.canvas-edge{fill:none;stroke:#8eafe9;stroke-width:2;stroke-dasharray:7 8;animation:canvas-flow 1.2s linear infinite}.canvas-node{position:absolute;width:225px;min-height:118px;border:1px solid #d7e2f1;border-radius:15px;background:rgba(255,255,255,.96);box-shadow:0 8px 18px rgba(39,57,91,.1);transition:box-shadow .18s ease,border-color .18s ease}.canvas-node:hover{border-color:#99b9ed;box-shadow:0 11px 24px rgba(39,110,241,.15)}.canvas-node.is-selected{border-color:#4c88ed;box-shadow:0 0 0 3px rgba(76,136,237,.18),0 11px 24px rgba(39,110,241,.15)}.canvas-node-button{display:block;width:100%;min-height:116px;padding:13px 14px;text-align:left;border:0!important;border-radius:15px;background:transparent!important;box-shadow:none!important;color:#172033!important}.canvas-node-button:hover{transform:none!important;background:#f8fbff!important}.canvas-node-top{display:flex;justify-content:space-between;gap:8px;align-items:center;margin-bottom:9px}.canvas-node-pr{color:#276ef1;font-size:12px;font-weight:750}.canvas-node-time{color:#8a97aa;font-size:11px}.canvas-node-title{display:block;color:#172033;font-size:14px;font-weight:700;line-height:1.35;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}.canvas-node-meta{display:block;margin-top:9px;color:#68758b;font-size:11px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.canvas-node-status{display:inline-flex;margin-top:7px;padding:3px 7px;border-radius:999px;font-size:11px;font-weight:700}.canvas-node-status.ok{color:#168451;background:#f0fbf5}.canvas-node-status.warn{color:#a96600;background:#fff8e9}.canvas-node-status.danger{color:#c23838;background:#fff2f2}.canvas-detail{position:relative;min-height:540px;border:1px solid #dbe4f0;border-radius:17px;background:rgba(255,255,255,.88);padding:17px;overflow:auto}.canvas-detail.empty{display:grid;place-items:center;text-align:center;color:#68758b}.canvas-detail h3{margin:0 0 7px;color:#172033;font-size:17px;line-height:1.35}.canvas-detail .detail-label{color:#8a97aa;font-size:11px;text-transform:uppercase;letter-spacing:.05em;margin-top:13px}.canvas-detail .detail-value{color:#31415a;font-size:13px;word-break:break-word;margin-top:2px}.canvas-detail .detail-actions{margin-top:17px}.canvas-detail .detail-close{position:absolute;right:11px;top:9px;border:0!important;box-shadow:none!important;background:transparent!important;color:#8a97aa!important;padding:4px 7px}.canvas-empty{display:grid;place-items:center;min-height:500px;padding:40px;text-align:center;color:#68758b}.canvas-empty strong{display:block;color:#31415a;font-size:16px;margin-bottom:6px}@keyframes canvas-flow{to{stroke-dashoffset:-30}}@media(prefers-reduced-motion:reduce){.canvas-edge{animation:none}}@media(max-width:900px){#control-deck{position:relative;top:0}.canvas-layout{grid-template-columns:1fr}.canvas-detail{min-height:260px;max-height:none}.canvas-viewport{min-height:480px}}@media(max-width:680px){.control-deck .toggle-grid{grid-template-columns:1fr}.control-deck-heading{display:block}.control-deck-heading .pill{display:inline-flex;margin-top:8px}.canvas-viewport{min-height:420px}.canvas-toolbar{align-items:flex-start}.canvas-actions{width:100%}.canvas-actions select{flex:1}}
+</style><style>
+.canvas-panel{width:100vw!important;margin-left:calc(50% - 50vw)!important}.canvas-viewport{height:calc(100vh - 250px)!important;min-height:540px!important;user-select:none;-webkit-user-select:none}.canvas-world,.canvas-node,.canvas-node-button{user-select:none;-webkit-user-select:none}
 </style><script>
 (function(){
   const controlDeck=document.createElement('section');controlDeck.id='control-deck';controlDeck.setAttribute('aria-labelledby','control-deck-heading');controlDeck.innerHTML='<div class="control-deck-heading"><div><div class="eyebrow">安全控制台</div><h2 id="control-deck-heading">链路控制</h2><p>GitHub 是事件中转；每个方向的开关与审批授权保持独立。</p></div><span class="pill good">本机服务 · 127.0.0.1</span></div>';
   const noticeBox=document.querySelector('#notice'),repositoryCard=document.querySelector('#repository-card'),browserPanel=document.querySelector('#browser').closest('section'),controlsPanel=document.querySelector('#controls').closest('section');[noticeBox,repositoryCard,browserPanel,controlsPanel].forEach((node,index)=>{if(!node)return;if(index>0)node.classList.add('control-deck-section');controlDeck.append(node)});document.querySelector('main header').after(controlDeck);
   const oldTimeline=document.querySelector('#pr-timeline'),canvasRoot=oldTimeline;oldTimeline.innerHTML='<div class="canvas-toolbar"><div><h2 id="canvas-heading">PR 事件画布</h2><p id="canvas-subtitle">拖拽平移、滚轮缩放；点击事件节点查看完整上下文。</p></div><div class="canvas-actions"><label for="canvas-pr-filter">项目 / PR</label><select id="canvas-pr-filter" aria-label="选择要显示的 PR"></select><span class="canvas-zoom"><button type="button" id="canvas-zoom-out" aria-label="缩小">−</button><output id="canvas-zoom-level">100%</output><button type="button" id="canvas-zoom-in" aria-label="放大">+</button></span><button type="button" id="canvas-fit">适配视图</button><button type="button" id="canvas-reset">重置视图</button></div></div><div class="canvas-layout"><div class="canvas-viewport" id="canvas-viewport" tabindex="0" role="application" aria-label="PR 事件画布，可拖拽平移和滚轮缩放"><div id="canvas-world" class="canvas-world"></div></div><aside id="canvas-detail" class="canvas-detail empty" aria-live="polite"><div>选择一个事件节点<br>查看完整变动、上下文和可用操作</div></aside></div>';oldTimeline.classList.add('canvas-panel');
   const legacyEvents=document.querySelector('#events-heading').closest('section');legacyEvents.style.display='none';
-  const viewport=document.querySelector('#canvas-viewport'),world=document.querySelector('#canvas-world'),detail=document.querySelector('#canvas-detail'),filter=document.querySelector('#canvas-pr-filter'),zoomLevel=document.querySelector('#canvas-zoom-level');let canvasFilter='all',selectedEventKey=null,view={scale:1,x:0,y:0,fit:false,dragging:false,moved:false,startX:0,startY:0,originX:0,originY:0};
+  const viewport=document.querySelector('#canvas-viewport'),world=document.querySelector('#canvas-world'),detail=document.querySelector('#canvas-detail'),filter=document.querySelector('#canvas-pr-filter'),zoomLevel=document.querySelector('#canvas-zoom-level');let canvasFilter='all',selectedEventKey=null,canvasEventByKey=new Map(),canvasData=null,view={scale:1,x:0,y:0,fit:false,dragging:false,moved:false,startX:0,startY:0,originX:0,originY:0};
   const titleForKey=key=>key.startsWith('pr:')?'PR #'+key.slice(3):key.startsWith('unassigned:chain:')?'未关联 PR · 因果链':'未关联 PR · 独立事件';
+  const rememberCanvasEvents=events=>{canvasEventByKey=new Map(events.map(event=>[event.event_key,event]))};
   const canvasTracks=events=>{const ordered=[...events].sort((a,b)=>String(a.observed_at).localeCompare(String(b.observed_at)));const prGroups=new Map(),unassigned=[];ordered.forEach(event=>{if(event.pr_number==null)unassigned.push(event);else{const key='pr:'+event.pr_number;if(!prGroups.has(key))prGroups.set(key,[]);prGroups.get(key).push(event)}});const tracks=[...prGroups.entries()].map(([key,items])=>({key,title:titleForKey(key),events:items,edges:items.slice(1).map((event,index)=>[items[index].event_key,event.event_key])}));const byKey=new Map(unassigned.map(event=>[event.event_key,event])),seen=new Set;for(const event of unassigned){if(seen.has(event.event_key))continue;const component=new Set([event.event_key]),stack=[event.event_key];while(stack.length){const key=stack.pop(),current=byKey.get(key);for(const candidate of unassigned){if((candidate.caused_by===key||current?.caused_by===candidate.event_key)&&!component.has(candidate.event_key)){component.add(candidate.event_key);stack.push(candidate.event_key)}}}component.forEach(key=>seen.add(key));const items=unassigned.filter(item=>component.has(item.event_key));const chained=items.some(item=>item.caused_by&&component.has(item.caused_by));const root=items.find(item=>!item.caused_by)||items[0];const key=chained?'unassigned:chain:'+root.event_key:'unassigned:event:'+event.event_key;tracks.push({key,title:chained?'未关联 PR · 因果链 · '+root.subject:'未关联 PR · 独立事件 · '+event.subject,events:items,edges:chained?items.filter(item=>item.caused_by&&component.has(item.caused_by)).map(item=>[item.caused_by,item.event_key]):[]})}return tracks.sort((a,b)=>String(a.events[0]?.observed_at).localeCompare(String(b.events[0]?.observed_at)))};
   const updateTransform=()=>{world.style.transform=`translate(${view.x}px,${view.y}px) scale(${view.scale})`;zoomLevel.textContent=Math.round(view.scale*100)+'%'};
   const fitCanvas=()=>{const width=parseFloat(world.style.width)||1,height=parseFloat(world.style.height)||1,w=viewport.clientWidth,h=viewport.clientHeight;view.scale=Math.min(1,Math.max(.35,Math.min((w-40)/width,(h-40)/height)));view.x=Math.max(20,(w-width*view.scale)/2);view.y=Math.max(20,(h-height*view.scale)/2);view.fit=true;updateTransform()};
   const zoomCanvasAt=(factor,clientX,clientY)=>{const old=view.scale,next=Math.min(2.2,Math.max(.35,old*factor)),rect=viewport.getBoundingClientRect(),px=clientX-rect.left,py=clientY-rect.top;view.x=px-(px-view.x)*(next/old);view.y=py-(py-view.y)*(next/old);view.scale=next;updateTransform()};
   const zoomCanvas=factor=>zoomCanvasAt(factor,viewport.getBoundingClientRect().left+viewport.clientWidth/2,viewport.getBoundingClientRect().top+viewport.clientHeight/2);
-  const renderDetail=event=>{if(!event){detail.className='canvas-detail empty';detail.innerHTML='<div>选择一个事件节点<br>查看完整变动、上下文和可用操作</div>';return}const retry=['awaiting approval','needs human'].includes(event.status);detail.className='canvas-detail';detail.innerHTML=`<button type="button" class="detail-close" aria-label="关闭详情">×</button><div class="detail-label">${event.pr_number==null?'未关联 PR':'PR #'+esc(event.pr_number)}</div><h3>${esc(event.subject)}</h3><span class="pill ${event.status==='needs human'?'danger':event.status==='awaiting approval'?'warn':'good'}">${esc(status[event.status]||event.status)}</span><div class="detail-label">时间 / 来源</div><div class="detail-value">${esc(event.observed_at)} · ${esc(origin[event.origin]||event.origin)}</div><div class="detail-label">提交 / 分支</div><div class="detail-value">${esc(event.sha)}<br>${esc(event.ref||'未记录分支')}</div><div class="detail-label">Event ID</div><div class="detail-value">${esc(event.event_key)}</div>${event.caused_by?`<div class="detail-label">因果链</div><div class="detail-value">${esc(event.caused_by)}</div>`:''}<div class="detail-label">执行详情</div><div class="detail-value">${esc(event.detail||'暂无详情')}</div>${retry?`<div class="detail-actions"><button type="button" class="${event.status==='needs human'?'danger':'primary'}" data-canvas-event-action="${esc(event.event_key)}">${event.status==='needs human'?'修复后重试':'批准此事件'}</button></div>`:''}`;detail.querySelector('.detail-close').addEventListener('click',()=>{selectedEventKey=null;renderDetail(null);document.querySelectorAll('.canvas-node').forEach(node=>node.classList.remove('is-selected'))});const action=detail.querySelector('[data-canvas-event-action]');if(action)action.addEventListener('click',()=>approve(action.dataset.canvasEventAction))};
-  const renderCanvas=data=>{const allEvents=data.events||[],allTracks=canvasTracks(allEvents),tracks=canvasFilter==='all'?allTracks:allTracks.filter(track=>track.key===canvasFilter),options=['<option value="all">全部轨道（'+allTracks.length+'）</option>'].concat(allTracks.map(track=>`<option value="${esc(track.key)}">${esc(track.title)}（${track.events.length} 个事件）</option>`));if(filter.innerHTML!==options.join(''))filter.innerHTML=options.join('');if(!allTracks.some(track=>track.key===canvasFilter)&&canvasFilter!=='all')canvasFilter='all';filter.value=canvasFilter;const width=Math.max(700,...tracks.map(track=>track.events.length*265+80)),height=Math.max(430,tracks.length*190+55);world.style.width=width+'px';world.style.height=height+'px';const positions=new Map;let nodes='';tracks.forEach((track,row)=>{const y=30+row*190;track.events.forEach((event,index)=>{const x=35+index*265;positions.set(event.event_key,{x,y});const toneClass=event.status==='needs human'?'danger':event.status==='awaiting approval'?'warn':'ok';nodes+=`<article class="canvas-node ${selectedEventKey===event.event_key?'is-selected':''}" style="left:${x}px;top:${y}px" data-canvas-node="${esc(event.event_key)}"><button type="button" class="canvas-node-button" aria-label="${esc(track.title+'：'+event.subject)}"><span class="canvas-node-top"><span class="canvas-node-pr">${esc(track.title)}</span><span class="canvas-node-time">${esc(event.observed_at.slice(11,16))}</span></span><span class="canvas-node-title">${esc(event.subject)}</span><span class="canvas-node-meta">${esc(origin[event.origin]||event.origin)} · ${esc(event.sha.slice(0,8))}</span><span class="canvas-node-status ${toneClass}">${esc(status[event.status]||event.status)}</span></button></article>`})});let lines='<svg class="canvas-edges" width="'+width+'" height="'+height+'" aria-hidden="true"><defs><marker id="canvas-arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="#8eafe9"></path></marker></defs>';tracks.forEach(track=>track.edges.forEach(([from,to])=>{const start=positions.get(from),end=positions.get(to);if(start&&end)lines+=`<line class="canvas-edge" marker-end="url(#canvas-arrow)" x1="${start.x+225}" y1="${start.y+59}" x2="${end.x+5}" y2="${end.y+59}"></line>`}));lines+='</svg>';world.innerHTML=tracks.length?lines+nodes:'<div class="canvas-empty"><div><strong>当前筛选条件下没有事件</strong>如需查看其它 PR，请更改上方筛选。</div></div>';world.querySelectorAll('[data-canvas-node]').forEach(node=>node.querySelector('button').addEventListener('click',()=>{selectedEventKey=node.dataset.canvasNode;const event=allEvents.find(item=>item.event_key===selectedEventKey);document.querySelectorAll('.canvas-node').forEach(item=>item.classList.toggle('is-selected',item===node));renderDetail(event)}));if(selectedEventKey){const selected=allEvents.find(event=>event.event_key===selectedEventKey);if(selected)renderDetail(selected);else{selectedEventKey=null;renderDetail(null)}}if(!view.fit)requestAnimationFrame(fitCanvas);else updateTransform()};
-  viewport.addEventListener('pointerdown',event=>{if(event.target.closest('button'))return;view.dragging=true;view.moved=false;view.startX=event.clientX;view.startY=event.clientY;view.originX=view.x;view.originY=view.y;viewport.classList.add('is-dragging');viewport.setPointerCapture?.(event.pointerId)});viewport.addEventListener('pointermove',event=>{if(!view.dragging)return;const dx=event.clientX-view.startX,dy=event.clientY-view.startY;if(Math.abs(dx)+Math.abs(dy)>3)view.moved=true;view.x=view.originX+dx;view.y=view.originY+dy;updateTransform()});const stopDrag=event=>{if(!view.dragging)return;view.dragging=false;viewport.classList.remove('is-dragging');viewport.releasePointerCapture?.(event.pointerId)};viewport.addEventListener('pointerup',stopDrag);viewport.addEventListener('pointercancel',stopDrag);viewport.addEventListener('wheel',event=>{event.preventDefault();zoomCanvasAt(Math.exp(-Math.max(-120,Math.min(120,event.deltaY))*.0015),event.clientX,event.clientY)},{passive:false});document.querySelector('#canvas-zoom-in').addEventListener('click',()=>zoomCanvas(1.2));document.querySelector('#canvas-zoom-out').addEventListener('click',()=>zoomCanvas(.83));document.querySelector('#canvas-fit').addEventListener('click',fitCanvas);document.querySelector('#canvas-reset').addEventListener('click',()=>{view={scale:1,x:0,y:0,fit:false,dragging:false,moved:false,startX:0,startY:0,originX:0,originY:0};updateTransform();requestAnimationFrame(fitCanvas)});filter.addEventListener('change',event=>{canvasFilter=event.target.value;view.fit=false;if(latest)renderCanvas(latest)});
-renderEvents=data=>{baseRenderEvents(data);renderRepository(data.repository);renderCanvas(data)};if(latest)renderEvents(latest);
+  const renderDetail=event=>{if(!event){detail.className='canvas-detail empty';detail.innerHTML='<div>选择一个事件节点<br>查看完整变动、上下文和可用操作</div>';return}const retry=!event.cloud&&['awaiting approval','needs human'].includes(event.status);detail.className='canvas-detail';detail.innerHTML=`<button type="button" class="detail-close" aria-label="关闭详情">×</button><div class="detail-label">${event.pr_number==null?'未关联 PR':'PR #'+esc(event.pr_number)}</div><h3>${esc(event.subject)}</h3><span class="pill ${event.status==='needs human'?'danger':event.status==='awaiting approval'?'warn':'good'}">${esc(status[event.status]||event.status)}</span><div class="detail-label">时间 / 来源</div><div class="detail-value">${esc(event.observed_at)} · ${esc(origin[event.origin]||event.origin)}</div><div class="detail-label">提交 / 分支</div><div class="detail-value">${esc(event.sha)}<br>${esc(event.ref||'未记录分支')}</div><div class="detail-label">Event ID</div><div class="detail-value">${esc(event.event_key)}</div>${event.caused_by?`<div class="detail-label">因果链</div><div class="detail-value">${esc(event.caused_by)}</div>`:''}<div class="detail-label">执行详情</div><div class="detail-value">${esc(event.detail||'暂无详情')}</div>${event.cloud?'<div class="detail-label">数据来源</div><div class="detail-value">GitHub 云端 commit 历史；本地触发器未记录该事件。</div>':''}${retry?`<div class="detail-actions"><button type="button" class="${event.status==='needs human'?'danger':'primary'}" data-canvas-event-action="${esc(event.event_key)}">${event.status==='needs human'?'修复后重试':'批准此事件'}</button></div>`:''}`;detail.querySelector('.detail-close').addEventListener('click',()=>{selectedEventKey=null;renderDetail(null);document.querySelectorAll('.canvas-node').forEach(node=>node.classList.remove('is-selected'))});const action=detail.querySelector('[data-canvas-event-action]');if(action)action.addEventListener('click',()=>approve(action.dataset.canvasEventAction));window.dispatchEvent(new Event('canvas-selection-changed'));setTimeout(()=>window.__loadTask?.(),0)};
+  const renderCanvas=data=>{canvasData=data;window.__canvasData=data;const allEvents=data.events||[];rememberCanvasEvents(allEvents);window.__canvasEventByKey=canvasEventByKey;const allTracks=canvasTracks(allEvents),tracks=canvasFilter==='all'?allTracks:allTracks.filter(track=>track.key===canvasFilter),options=['<option value="all">全部轨道（'+allTracks.length+'）</option>'].concat(allTracks.map(track=>`<option value="${esc(track.key)}">${esc(track.title)}（${track.events.length} 个事件）</option>`));if(filter.innerHTML!==options.join(''))filter.innerHTML=options.join('');if(!allTracks.some(track=>track.key===canvasFilter)&&canvasFilter!=='all')canvasFilter='all';filter.value=canvasFilter;const width=Math.max(700,...tracks.map(track=>track.events.length*265+80)),height=Math.max(430,tracks.length*190+55);world.style.width=width+'px';world.style.height=height+'px';const positions=new Map;let nodes='';tracks.forEach((track,row)=>{const y=30+row*190;track.events.forEach((event,index)=>{const x=35+index*265;positions.set(event.event_key,{x,y});const toneClass=event.status==='needs human'?'danger':event.status==='awaiting approval'?'warn':'ok';nodes+=`<article class="canvas-node ${selectedEventKey===event.event_key?'is-selected':''}" style="left:${x}px;top:${y}px" data-canvas-node="${esc(event.event_key)}"><button type="button" class="canvas-node-button" aria-label="${esc(track.title+'：'+event.subject)}"><span class="canvas-node-top"><span class="canvas-node-pr">${esc(track.title)}</span><span class="canvas-node-time">${esc(event.observed_at.slice(11,16))}</span></span><span class="canvas-node-title">${esc(event.subject)}</span><span class="canvas-node-meta">${esc(origin[event.origin]||event.origin)} · ${esc(event.sha.slice(0,8))}</span><span class="canvas-node-status ${toneClass}">${esc(status[event.status]||event.status)}</span></button></article>`})});let lines='<svg class="canvas-edges" width="'+width+'" height="'+height+'" aria-hidden="true"><defs><marker id="canvas-arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="#8eafe9"></path></marker></defs>';tracks.forEach(track=>track.edges.forEach(([from,to])=>{const start=positions.get(from),end=positions.get(to);if(start&&end)lines+=`<line class="canvas-edge" marker-end="url(#canvas-arrow)" x1="${start.x+225}" y1="${start.y+59}" x2="${end.x+5}" y2="${end.y+59}"></line>`}));lines+='</svg>';world.innerHTML=tracks.length?lines+nodes:'<div class="canvas-empty"><div><strong>当前筛选条件下没有事件</strong>如需查看其它 PR，请更改上方筛选。</div></div>';world.querySelectorAll('[data-canvas-node]').forEach(node=>node.querySelector('button').addEventListener('click',()=>{selectedEventKey=node.dataset.canvasNode;window.__selectedCanvasEventKey=selectedEventKey;const event=allEvents.find(item=>item.event_key===selectedEventKey);document.querySelectorAll('.canvas-node').forEach(item=>item.classList.toggle('is-selected',item===node));renderDetail(event)}));if(selectedEventKey){const selected=allEvents.find(event=>event.event_key===selectedEventKey);if(selected)renderDetail(selected);else{selectedEventKey=null;renderDetail(null)}}if(!view.fit)requestAnimationFrame(fitCanvas);else updateTransform()};
+  window.addEventListener('canvas-filter-changed',event=>{canvasFilter=event.detail||'all';view.fit=false;if(canvasData)renderCanvas(canvasData)});
+  viewport.addEventListener('pointerdown',event=>{if(event.target.closest('button'))return;view.dragging=true;view.moved=false;view.startX=event.clientX;view.startY=event.clientY;view.originX=view.x;view.originY=view.y;viewport.classList.add('is-dragging');viewport.setPointerCapture?.(event.pointerId)});viewport.addEventListener('pointermove',event=>{if(!view.dragging)return;const dx=event.clientX-view.startX,dy=event.clientY-view.startY;if(Math.abs(dx)+Math.abs(dy)>3)view.moved=true;view.x=view.originX+dx;view.y=view.originY+dy;updateTransform()});const stopDrag=event=>{if(!view.dragging)return;view.dragging=false;viewport.classList.remove('is-dragging');viewport.releasePointerCapture?.(event.pointerId)};viewport.addEventListener('pointerup',stopDrag);viewport.addEventListener('pointercancel',stopDrag);viewport.addEventListener('wheel',event=>{event.preventDefault();zoomCanvasAt(Math.exp(-Math.max(-120,Math.min(120,event.deltaY))*.0015),event.clientX,event.clientY)},{passive:false});document.querySelector('#canvas-zoom-in').addEventListener('click',()=>zoomCanvas(1.2));document.querySelector('#canvas-zoom-out').addEventListener('click',()=>zoomCanvas(.83));document.querySelector('#canvas-fit').addEventListener('click',fitCanvas);document.querySelector('#canvas-reset').addEventListener('click',()=>{view={scale:1,x:0,y:0,fit:false,dragging:false,moved:false,startX:0,startY:0,originX:0,originY:0};updateTransform();requestAnimationFrame(fitCanvas)});
+renderEvents=data=>{baseRenderEvents(data);renderRepository(data.repository);const cloud=[];(data.github_prs?.prs||[]).forEach(pr=>{const commits=pr.commits||[];if(commits.length){commits.forEach(commit=>cloud.push({...commit,pr_number:pr.number,ref:pr.head?.ref||'',status:pr.state==='merged'?'dispatched':pr.state==='open'?'awaiting approval':'needs human',detail:'GitHub 云端 commit 历史 · '+(pr.html_url||''),cloud:true}))}else cloud.push({event_key:'github-pr-'+pr.number,sha:pr.head?.sha||('cloud-pr-'+pr.number),ref:pr.head?.ref||'',pr_number:pr.number,origin:'github',caused_by:null,subject:pr.title||('PR #'+pr.number),observed_at:pr.updated_at||pr.created_at||'',status:pr.state==='merged'?'dispatched':pr.state==='open'?'awaiting approval':'needs human',detail:'GitHub 云端 PR 历史'+(pr.html_url?' · '+pr.html_url:''),cloud:true})});renderCanvas({...data,events:[...(data.events||[]),...cloud]});if(data.github_prs?.error)document.querySelector('#canvas-subtitle').textContent='云端 PR 同步失败，当前显示本地事件：'+data.github_prs.error;};if(latest)renderEvents(latest);
 })();
 </script></html>"""
 
@@ -1052,6 +1380,7 @@ HTML += """<style>
 @media(max-width:900px){#control-deck{position:relative!important}.canvas-layout{grid-template-columns:1fr}.canvas-viewport{min-height:420px}}
 </style><script>
 (function(){
+  const refresh=document.createElement('button');refresh.type='button';refresh.textContent='从 GitHub 刷新';refresh.addEventListener('click',refreshGithub);window.__githubRefreshButton=refresh;document.querySelector('#canvas-pr-filter')?.after(refresh);
   const detail=document.querySelector('#canvas-detail');
   const taskOpenByEvent=new Map();
   const taskOpenState=eventKey=>{const saved=taskOpenByEvent.get(eventKey);if(saved&&typeof saved==='object')return saved;return {raw:saved===true,other:false}};
@@ -1062,8 +1391,10 @@ HTML += """<style>
   const renderTaskSections=(data,eventKey,scope='current',includeOther=true)=>{const open=taskOpenState(eventKey),sections=(data.sections||[]).map(section=>'<div class="task-section"><h4>'+esc(section.title)+'</h4><ul class="task-list">'+section.items.map(item=>{const state=taskState[item.state]||taskState.todo;return '<li class="task-item '+esc(item.state)+'"><span class="task-check" aria-hidden="true">'+state[0]+'</span><span class="task-item-label">'+esc(item.label)+'</span><span class="task-item-state">'+state[1]+'</span></li>'}).join('')+'</ul></div>').join('');const other=includeOther&&data.other_content?'<details id="task-document-other" class="task-other"'+(open.other?' open':'')+'><summary>其他内容（标题、说明和列表）</summary><pre>'+esc(data.other_content)+'</pre></details>':'';return sections||other?sections+other:'<div class="task-other">未解析到复选任务；可展开下方原始任务.md 核对。</div>'};
   const replacePanel=(panel,html)=>{const detailTop=detail.scrollTop,raw=document.querySelector('#task-document-raw'),rawTop=raw?.scrollTop||0;panel.innerHTML=html;detail.scrollTop=detailTop;const nextRaw=panel.querySelector('#task-document-raw');if(nextRaw)nextRaw.scrollTop=rawTop};
   const loadTask=()=>{
-    const selected=document.querySelector('.canvas-node.is-selected'),key=selected?.dataset.canvasNode;
-    const event=key&&typeof latest!=='undefined'&&latest?.events?.find(item=>item.event_key===key);
+    const selected=document.querySelector('.canvas-node.is-selected'),key=selected?.dataset.canvasNode||window.__selectedCanvasEventKey;
+    const eventMap=window.__canvasEventByKey;
+    let event=key&&((eventMap&&eventMap.get(key))||(window.__canvasData?.events||[]).find(item=>item.event_key===key)||(typeof latest!=='undefined'&&latest?.events?.find(item=>item.event_key===key)));
+    if(!event&&key){const match=String(key).match(/^(?:github|local):(\d+):/);if(match)event={event_key:key,pr_number:Number(match[1]),sha:key.split(':').pop(),observed_at:new Date().toISOString(),origin:'github',subject:'云端 commit',status:'dispatched',cloud:true}}
     if(!event||detail.querySelector('.task-document'))return;
     const panel=document.createElement('section');panel.className='task-document';replacePanel(panel,'<div class="detail-label">任务.md / 交接进度</div><div class="task-summary">只读读取中…</div>');detail.append(panel);
     fetch(taskUrl(event)).then(response=>response.json()).then(data=>{
@@ -1074,8 +1405,8 @@ HTML += """<style>
       const prefix=data.unassigned?'未关联 PR 的当前 handoff 任务':'PR #'+esc(data.pr_number)+' 的交接任务';
       const open=taskOpenState(event.event_key);
       const completed=data.sections?.flatMap(section=>section.items).filter(item=>item.state==='done').length||0,total=data.sections?.flatMap(section=>section.items).length||0,percent=total?Math.round(completed/total*100):0;
-      const historical=matchTaskHistory(history,event);
-      const historyBlock=historical?'<section class="task-history-block"><div class="detail-label">该事件时点的任务进度</div><div class="task-history-meta">匹配方式：'+(historical.match==='commit_sha'?'事件提交 SHA 精确匹配':'按事件时间匹配最近不晚于该事件的提交')+' · '+esc(historical.short_sha||historical.commit_sha?.slice(0,8)||'')+' · '+esc(historical.committed_at||'')+' · '+esc(historical.subject||'')+'</div><div class="task-summary">'+esc(historical.summary)+'</div>'+renderTaskSections(historical,event.event_key,'history',false)+'</section>':'<section class="task-history-block"><div class="detail-label">该事件时点的任务进度</div><div class="task-history-missing">无历史快照：无法将该事件与不晚于该事件的任务.md 提交可靠关联。</div></section>';
+      const historical=event.cloud?null:matchTaskHistory(history,event);
+      const historyBlock=historical?'<section class="task-history-block"><div class="detail-label">该事件时点的任务进度</div><div class="task-history-meta">匹配方式：'+(historical.match==='commit_sha'?'事件提交 SHA 精确匹配':'按事件时间匹配最近不晚于该事件的提交')+' · '+esc(historical.short_sha||historical.commit_sha?.slice(0,8)||'')+' · '+esc(historical.committed_at||'')+' · '+esc(historical.subject||'')+'</div><div class="task-summary">'+esc(historical.summary)+'</div>'+renderTaskSections(historical,event.event_key,'history',false)+'</section>':'<section class="task-history-block"><div class="detail-label">该事件时点的任务进度</div><div class="task-history-missing">'+(event.cloud?'该节点来自 GitHub 云端 commit；本地没有与该 SHA 对应的任务.md 历史快照。当前任务.md 仍按本地仓库现状显示。':'无历史快照：无法将该事件与不晚于该事件的任务.md 提交可靠关联。')+'</div></section>';
       const currentBlock='<section class="task-current-block"><div class="detail-label">当前最新任务进度</div><div class="task-path">'+prefix+' · '+esc(data.path)+'</div><div class="task-summary '+(data.all_complete?'task-complete-note':'')+'">'+esc(data.summary)+(data.truncated?'（内容已截断）':'')+'</div><div class="task-progress" aria-label="任务完成进度"><span class="task-progress-bar"><i style="width:'+percent+'%"></i></span><span>'+percent+'% 已完成</span></div>'+renderTaskSections(data,event.event_key,'current',true)+'</section>';
       replacePanel(panel,'<div class="detail-label">任务.md / 交接进度</div>'+historyBlock+currentBlock+'<details id="task-document-details"'+(open.raw?' open':'')+'><summary>'+ (open.raw?'收起原始任务.md':'查看原始任务.md（展开完整任务.md）') +'</summary><pre id="task-document-raw">'+esc(data.content)+'</pre></details>');
       const disclosure=panel.querySelector('#task-document-details'),otherDisclosure=panel.querySelector('#task-document-other'),summary=disclosure.querySelector('summary'),otherSummary=otherDisclosure?.querySelector('summary');
@@ -1085,18 +1416,28 @@ HTML += """<style>
       });
     }).catch(()=>{replacePanel(panel,'<div class="detail-label">任务.md / 交接进度</div><div class="task-summary">任务.md 读取失败，请稍后重试。</div>')});
   };
-  new MutationObserver(loadTask).observe(detail,{childList:true});loadTask();
+  filter.addEventListener('change',event=>{window.__canvasFilter=event.target.value;const data=window.__canvasData;if(data){window.__canvasFilter=event.target.value;window.dispatchEvent(new CustomEvent('canvas-filter-changed',{detail:event.target.value}))}});
+  window.__loadTask=loadTask;new MutationObserver(loadTask).observe(detail,{childList:true});window.addEventListener('canvas-selection-changed',loadTask);loadTask();
 })();
 </script><script>
 (function(){
   const deck=document.querySelector('#control-deck');if(!deck)return;
-  const panel=document.createElement('section');panel.className='binding-panel';panel.innerHTML='<h3>安全配对绑定</h3><p class="binding-note">绑定只使用 ChatGPT 端明确提供的稳定对话 ID；标题不能用于路由。token 只在创建/认领响应中显示。</p><div class="binding-list" id="binding-list"><span class="binding-note">读取绑定状态中…</span></div><details class="binding-create"><summary>创建一次性配对邀请</summary><form class="binding-form" id="binding-form"><input name="repository" placeholder="repository" required><input name="branch" placeholder="branch" required><input name="pr_number" type="number" min="1" placeholder="PR #" required><input name="web_conversation_id" placeholder="Web conversation ID" required><input name="web_conversation_title" placeholder="对话标题（可选）"><input name="expires_seconds" type="number" min="60" max="3600" value="900"><button class="primary" type="submit">生成邀请</button></form><div id="binding-token" class="binding-token" hidden></div></details>';deck.append(panel);
+  const panel=document.createElement('section');panel.className='binding-panel';panel.innerHTML='<h3>安全配对绑定</h3><p class="binding-note">默认按整个交接仓库建立一一对应：GPT 对话 ↔ 交接仓库 ↔ 本地 Codex。分支和 PR 暂不作为绑定粒度。</p><div class="binding-list" id="binding-list"><span class="binding-note">读取绑定状态中…</span></div><form class="binding-form" id="repository-connect-form"><textarea name="payload" rows="5" placeholder="粘贴 GPT 提供的信息：\nrepository: owner/repo\nweb_conversation_id: ...\nweb_conversation_title: ..." required></textarea><button class="primary" type="submit">确认连接此 GPT 对话</button></form><details class="binding-create"><summary>高级：创建一次性配对邀请（按 PR）</summary><form class="binding-form" id="binding-form"><input name="repository" placeholder="repository" required><input name="branch" placeholder="branch" required><input name="pr_number" type="number" min="1" placeholder="PR #" required><input name="web_conversation_id" placeholder="Web conversation ID" required><input name="web_conversation_title" placeholder="对话标题（可选）"><input name="expires_seconds" type="number" min="60" max="3600" value="900"><button class="primary" type="submit">生成邀请</button></form><div id="binding-token" class="binding-token" hidden></div></details>';deck.append(panel);
   const list=panel.querySelector('#binding-list'),form=panel.querySelector('#binding-form'),tokenBox=panel.querySelector('#binding-token');
   const render=data=>{const bindings=data.bindings||[];list.innerHTML=bindings.length?bindings.map(item=>'<div class="binding-row"><div><strong>'+esc(item.status)+' · '+esc(item.binding_id)+'</strong><small>'+esc(item.repository)+' / '+esc(item.branch)+' / PR #'+esc(item.pr_number)+'<br>Route: '+esc(item.route_id||'待认领')+' · Web: '+esc(item.web_conversation_title||item.web_conversation_id)+'<br>Local: '+esc(item.local_conversation_id||'待认领')+'<br>过期：'+esc(item.expires_at)+'</small></div>'+(item.status==='active'||item.status==='claimed'?'<button type="button" data-refresh-binding="'+esc(item.binding_id)+'">刷新 Web 对话名称</button>':'')+'</div>').join(''):'<span class="binding-note">当前没有配对绑定。</span>';list.querySelectorAll('[data-refresh-binding]').forEach(button=>button.addEventListener('click',async()=>{const response=await fetch('/api/bindings/refresh-name/'+encodeURIComponent(button.dataset.refreshBinding),{method:'POST'}),result=await response.json();notice(result.error||'刷新失败')}))};
   const load=()=>fetch('/api/bindings').then(response=>response.json()).then(render).catch(()=>{list.innerHTML='<span class="binding-note">绑定状态读取失败。</span>'});
-  form.repository.value=document.querySelector('.repo-name')?.textContent?.trim()||'';form.addEventListener('submit',async event=>{event.preventDefault();const values=Object.fromEntries(new FormData(form));values.pr_number=Number(values.pr_number);values.expires_seconds=Number(values.expires_seconds);const response=await fetch('/api/bindings/invite',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(values)}),result=await response.json();tokenBox.hidden=false;tokenBox.textContent=result.ok?'一次性邀请 token（仅本次显示）：'+result.token:'创建失败：'+(result.error||'unknown error');if(result.ok){form.reset();form.repository.value=document.querySelector('.repo-name')?.textContent?.trim()||'';load()}});load();
+  form.repository.value=document.querySelector('.repo-name')?.textContent?.trim()||'';form.addEventListener('submit',async event=>{event.preventDefault();const values=Object.fromEntries(new FormData(form));values.pr_number=Number(values.pr_number);values.expires_seconds=Number(values.expires_seconds);const response=await fetch('/api/bindings/invite',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(values)}),result=await response.json();tokenBox.hidden=false;tokenBox.textContent=result.ok?'一次性邀请 token（仅本次显示）：'+result.token:'创建失败：'+(result.error||'unknown error');if(result.ok){form.reset();form.repository.value=document.querySelector('.repo-name')?.textContent?.trim()||'';load()}});const connectForm=document.querySelector('#repository-connect-form');connectForm.addEventListener('submit',async event=>{event.preventDefault();const raw=new FormData(connectForm).get('payload')||'';const values={repository:(String(raw).match(/repository\s*[:=]\s*([^\s]+)/i)||[])[1],web_conversation_id:(String(raw).match(/web_conversation_id\s*[:=]\s*([^\s]+)/i)||[])[1],web_conversation_title:(String(raw).match(/web_conversation_title\s*[:=]\s*(.+)/i)||[])[1]};try{const result=await api('/api/bindings/connect',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(values)});notice('已连接：'+(result.binding?.web_conversation_title||result.binding?.web_conversation_id||'GPT 对话'));load()}catch(error){notice('连接失败：'+error.message)}});load();
 })();
 </script>"""
+
+
+HTML += r"""
+<style>
+#pr-timeline{background:#f2f5fa;border-radius:24px;padding:18px}.v3bar{display:flex;justify-content:space-between;align-items:center;gap:12px;margin-bottom:14px}.v3bar h2{margin:0;font-size:20px}.v3bar select,.v3bar button{border:1px solid #d8e0ec;border-radius:12px;background:#fff;padding:9px 12px}.v3layout{display:grid;grid-template-columns:minmax(0,1fr) 360px;gap:14px}.v3canvas{height:calc(100vh - 280px);min-height:560px;overflow:hidden;border-radius:20px;background:radial-gradient(#d7e2f3 1px,transparent 1px),#f8fafd;background-size:22px 22px;cursor:grab;touch-action:none;user-select:none;-webkit-user-select:none}.v3canvas::selection,.v3canvas *::selection{background:transparent;color:inherit}.v3canvas.dragging{cursor:grabbing}.v3stage{transform-origin:0 0;display:flex;flex-direction:column;gap:28px;padding:28px;min-width:max-content;will-change:transform;user-select:none;-webkit-user-select:none}.v3track{display:flex;align-items:center;gap:14px;min-width:max-content}.v3node{width:238px;min-height:150px;padding:15px;border:1px solid #e0e7f1;border-radius:18px;background:rgba(255,255,255,.94);box-shadow:0 8px 22px #1d355715;cursor:pointer;user-select:none;-webkit-user-select:none}.v3node.unknown{opacity:.58}.v3node.selected{border:2px solid #2677f5;box-shadow:0 0 0 4px #2677f526}.v3node h4{margin:0 0 7px;font-size:13px;color:#2677f5}.v3subject{font-weight:700;line-height:1.35}.v3meta{margin-top:8px;color:#748197;font-size:11px;line-height:1.4}.v3badge{display:inline-block;margin-top:9px;padding:4px 8px;border-radius:99px;font-size:11px;font-weight:700}.v3badge.ok{background:#e9f9ef;color:#168451}.v3badge.warn{background:#fff4dc;color:#a96600}.v3badge.err{background:#ffeded;color:#c23838}.v3arrow{color:#8eafe9;font-size:22px;user-select:none;-webkit-user-select:none}.v3detail{height:calc(100vh - 280px);min-height:560px;overflow:auto;border-radius:20px;background:rgba(255,255,255,.9);padding:20px;box-shadow:0 8px 22px #1d355710}.v3detail h3{margin:0 0 8px}.v3section{margin-top:16px;padding-top:14px;border-top:1px solid #e7edf5}.v3task-item{display:flex;gap:9px;align-items:flex-start;padding:9px 10px;margin:7px 0;background:#f7f9fd;border-radius:12px;font-size:13px}.v3task-check{width:20px;height:20px;display:grid;place-items:center;border-radius:7px;background:#e8eef8;color:#748197}.v3task-item.done .v3task-check{background:#ddf5e6;color:#168451}.v3task-progress{height:7px;background:#e7edf5;border-radius:99px;overflow:hidden}.v3task-progress i{display:block;height:100%;background:#35b56c}.v3detail pre{white-space:pre-wrap;background:#f7f9fd;border-radius:12px;padding:12px;font-size:12px}@media(max-width:900px){.v3layout{grid-template-columns:1fr}.v3detail{height:420px;min-height:420px}}
+</style><script>
+(()=>{window.__v3Active=true;const root=document.querySelector('#pr-timeline');if(!root)return;const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));const st={events:[],filter:'all',selected:null,scale:1,x:0,y:0,drag:false,moved:false,sx:0,sy:0,ox:0,oy:0};const status=e=>{if(['needs human','error','failed'].includes(e.status))return ['err','出现错误'];if(e.status==='awaiting approval')return ['warn','等待审批'];if(e.status==='dispatched')return ['ok','自动审批成功'];return ['ok','已记录']};const build=d=>{const a=[...(d.events||[])];(d.github_prs?.prs||[]).forEach(p=>(p.commits||[]).forEach(c=>a.push({...c,pr_number:p.number,ref:p.head?.ref||'',cloud:true,status:p.state==='open'?'awaiting approval':'dispatched',origin:c.origin||'unknown',agent_id:c.agent_id||c.agent||'',gpt_id:c.gpt_id||c.chatgpt_id||''})));return a.sort((a,b)=>String(a.observed_at).localeCompare(String(b.observed_at)))};const apply=()=>{const s=root.querySelector('#v3stage');if(s)s.style.transform='translate3d('+st.x+'px,'+st.y+'px,0) scale('+st.scale+')';const z=root.querySelector('#v3zoom');if(z)z.textContent=Math.round(st.scale*100)+'%'};const task=async e=>{const b=root.querySelector('#v3task');if(!b)return;b.innerHTML='<div class="v3section"><b>任务.md</b><p>读取历史快照中…</p></div>';try{const x=await fetch('/api/task/at-commit?pr='+encodeURIComponent(e.pr_number??'unassigned')+'&sha='+encodeURIComponent(e.sha)).then(r=>r.json());if(!x.ok){b.innerHTML='<div class="v3section"><b>任务.md</b><p>'+esc(x.error||'该 commit 无任务.md 快照')+'</p></div>';return;}const items=(x.sections||[]).flatMap(s=>s.items||[]),done=items.filter(i=>i.state==='done').length,p=items.length?Math.round(done/items.length*100):0;b.innerHTML='<div class="v3section"><b>任务.md · '+esc(x.commit_sha?'历史快照':'当前状态')+'</b><div class="v3meta">'+esc(x.committed_at||x.path||'')+' · '+esc(x.summary||'')+'</div><div class="v3task-progress"><i style="width:'+p+'%"></i></div><div class="v3meta">'+p+'% 已完成</div>'+items.map(i=>'<div class="v3task-item '+(i.state==='done'?'done':'')+'"><span class="v3task-check">'+(i.state==='done'?'✓':'')+'</span><span>'+esc(i.label)+'</span></div>').join('')+'<details><summary>查看原始任务.md</summary><pre>'+esc(x.content||'')+'</pre></details></div>'}catch(err){b.innerHTML='<div class="v3section"><b>任务.md</b><p>读取失败：'+esc(err.message)+'</p></div>'}};const render=()=>{const nums=[...new Set(st.events.filter(e=>e.pr_number!=null).map(e=>e.pr_number))].sort((a,b)=>a-b),events=st.events.filter(e=>(st.filter==='all'||String(e.pr_number)===String(st.filter))&&(st.showUnknown||['agent','chatgpt'].includes(String(e.origin||'').toLowerCase()))),groups=new Map;events.forEach(e=>{const k=e.pr_number??'unassigned';if(!groups.has(k))groups.set(k,[]);groups.get(k).push(e)});root.innerHTML='<div class="v3bar"><h2>PR 事件画布</h2><div><select id="v3filter"><option value="all">全部轨道</option>'+nums.map(n=>'<option value="'+n+'">PR #'+n+'</option>').join('')+'</select> <button id="v3minus">−</button><span id="v3zoom">'+Math.round(st.scale*100)+'%</span><button id="v3plus">+</button><button id="v3fit">适配</button><button id="v3unknown" title="显示/隐藏未知来源节点">'+(st.showUnknown?'◉':'◌')+' 未知</button></div></div><div class="v3layout"><div class="v3canvas" id="v3canvas"><div class="v3stage" id="v3stage">'+([...groups.entries()].map(([k,es])=>'<div class="v3track">'+es.map((e,i)=>{const [tone,label]=status(e),origin=(e.origin||'unknown').toLowerCase(),known=['agent','chatgpt'].includes(origin);return '<div class="v3node '+(known?'':'unknown ') +(st.selected===e.event_key?'selected':'')+'" data-key="'+esc(e.event_key)+'"><h4>PR #'+esc(k)+'</h4><div class="v3subject">'+esc(e.subject)+'</div><div class="v3meta">来源：'+esc(origin.toUpperCase())+'<br>Agent ID：'+esc(e.agent_id||'未记录')+'<br>GPT ID：'+esc(e.gpt_id||'未记录')+'<br>事件：'+esc(e.event_key||e.sha||'unknown')+'</div><span class="v3badge '+tone+'">'+label+'</span></div>'+(i<es.length-1?'<span class="v3arrow">→</span>':'')}).join('')+'</div>').join('')||'<p>当前筛选条件下没有事件</p>')+'</div></div><aside class="v3detail" id="v3detail">'+(st.selected?'<p>加载详情中…</p>':'<p>选择一个节点查看任务.md</p>')+'</aside></div>';const f=root.querySelector('#v3filter');f.value=st.filter;f.onchange=()=>{st.filter=f.value;st.selected=null;render()};root.querySelector('#v3minus').onclick=()=>{st.scale=Math.max(.4,st.scale*.85);apply()};root.querySelector('#v3plus').onclick=()=>{st.scale=Math.min(2.5,st.scale*1.18);apply()};root.querySelector('#v3fit').onclick=()=>{st.scale=1;st.x=20;st.y=20;apply()};root.querySelector('#v3unknown').onclick=()=>{st.showUnknown=!st.showUnknown;st.selected=null;render()};root.querySelector('#v3unknown').onclick=()=>{st.showUnknown=!st.showUnknown;st.selected=null;render()};root.querySelectorAll('.v3node').forEach(n=>n.onclick=()=>{st.moved=false;st.selected=n.dataset.key;const e=st.events.find(x=>x.event_key===st.selected);root.querySelectorAll('.v3node').forEach(x=>x.classList.toggle('selected',x===n));const d=root.querySelector('#v3detail');d.innerHTML='<h3>'+esc(e.subject)+'</h3><div class="v3meta">PR #'+esc(e.pr_number)+' · '+esc(e.observed_at)+'<br>来源：'+esc((e.origin||'unknown').toUpperCase())+'<br>Agent ID：'+esc(e.agent_id||'未记录')+'<br>GPT ID：'+esc(e.gpt_id||'未记录')+'<br>唯一标识：'+esc(e.event_key||e.sha)+'</div><div id="v3task"></div>';task(e)});const c=root.querySelector('#v3canvas');c.onpointerdown=e=>{if(e.target.closest('.v3node'))return;e.preventDefault();if(window.getSelection)window.getSelection().removeAllRanges();st.drag=true;st.moved=false;st.sx=e.clientX;st.sy=e.clientY;st.ox=st.x;st.oy=st.y;c.classList.add('dragging');c.setPointerCapture(e.pointerId)};c.onpointermove=e=>{if(st.drag){const dx=e.clientX-st.sx,dy=e.clientY-st.sy;if(Math.abs(dx)+Math.abs(dy)>4)st.moved=true;st.x=st.ox+dx;st.y=st.oy+dy;apply()}};c.onpointerup=c.onpointercancel=()=>{st.drag=false;c.classList.remove('dragging')};c.onwheel=e=>{e.preventDefault();st.scale=Math.max(.4,Math.min(2.5,st.scale*(e.deltaY<0?1.1:.9)));apply()};apply()};window.__v3Render=render;window.__v3Build=build;window.__v3State=st;fetch('/api/status').then(r=>r.json()).then(d=>{st.events=build(d);render()}).catch(()=>{root.innerHTML='<p>无法读取 Dashboard 数据</p>'});setInterval(()=>{if(!root.querySelector('.v3canvas')&&window.__v3Render)window.__v3Render()},1200)})();
+</script>"""
+
 
 
 def handler(service: Service):
@@ -1107,8 +1448,8 @@ def handler(service: Service):
         def do_GET(self):
             if self.path == "/": return self.reply(200, HTML, "text/html; charset=utf-8")
             if self.path == "/api/approvals": return self.reply(200, {"requests": pending_approval_requests()})
-            if self.path == "/api/status":
-                data = service.store.snapshot(); data["last_error"] = service.last_error; data["browser"] = service.browser_status; data["auto_mode"] = service.auto_mode(); data["repository"] = service.repository_status(); return self.reply(200, data)
+            if self.path == "/api/status" or self.path.startswith("/api/status?"):
+                data = service.store.snapshot(); data["last_error"] = service.last_error; data["browser"] = service.browser_status; data["auto_mode"] = service.auto_mode(); data["repository"] = service.repository_status(); data["github_prs"] = service.github_prs(parse_qs(urlparse(self.path).query).get("refresh", ["0"])[0] == "1"); return self.reply(200, data)
             parsed = urlparse(self.path)
             if parsed.path == "/api/bindings":
                 return self.reply(200, {"ok": True, "repository": service.repository_status(), "bindings": service.store.list_bindings(str(service.config.get("repository", "")))})
@@ -1119,6 +1460,13 @@ def handler(service: Service):
                 if not re.fullmatch(r"[1-9][0-9]*", raw_pr):
                     return self.reply(HTTPStatus.BAD_REQUEST, {"ok": False, "error": "invalid PR number"})
                 return self.reply(200, service.task_document(int(raw_pr)))
+            if parsed.path == "/api/task/at-commit":
+                query = parse_qs(parsed.query)
+                raw_pr, raw_sha = query.get("pr", [""])[0], query.get("sha", [""])[0]
+                try:
+                    return self.reply(200, service.task_at_commit(int(raw_pr), raw_sha))
+                except (TypeError, ValueError):
+                    return self.reply(400, {"ok": False, "error": "invalid PR number or commit SHA"})
             if parsed.path == "/api/task/history":
                 raw_pr = parse_qs(parsed.query).get("pr", ["unassigned"])[0]
                 if raw_pr == "unassigned":
@@ -1130,6 +1478,9 @@ def handler(service: Service):
         def do_POST(self):
             if self.path == "/api/poll": return self.reply(200, service.poll_once())
             if self.path == "/api/browser/check": return self.reply(200, service.check_browser())
+            if self.path == "/api/browser/open-chatgpt":
+                try: return self.reply(200, {"ok": True, "message": service.browser.open_chatgpt()})
+                except Exception as exc: return self.reply(502, {"ok": False, "error": str(exc)[:500]})
             if self.path.startswith("/api/bindings/"):
                 length = int(self.headers.get("Content-Length", "0"))
                 try:
@@ -1139,7 +1490,9 @@ def handler(service: Service):
                 if not isinstance(data, dict):
                     return self.reply(HTTPStatus.BAD_REQUEST, {"ok": False, "error": "JSON object required"})
                 suffix = self.path.removeprefix("/api/bindings/")
-                if suffix == "invite":
+                if suffix == "connect":
+                    result = service.connect_repository(data)
+                elif suffix == "invite":
                     result = service.create_binding(data)
                 elif suffix == "claim":
                     result = service.claim_binding(data)
