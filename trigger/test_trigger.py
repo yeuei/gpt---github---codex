@@ -4,6 +4,7 @@ import importlib.util
 import json
 import sqlite3
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -13,6 +14,7 @@ HERE = Path(__file__).resolve().parent
 SPEC = importlib.util.spec_from_file_location("trigger_runtime", HERE / "trigger.py")
 trigger = importlib.util.module_from_spec(SPEC)
 assert SPEC and SPEC.loader
+sys.modules[SPEC.name] = trigger
 SPEC.loader.exec_module(trigger)
 
 
