@@ -22,7 +22,7 @@ Local Agent（本地执行）
 Dashboard
 ```
 
-Dashboard 是**本地观察与审批界面**，不是第四套任务真源。正式任务仍由真实 PR 的
+Dashboard 是**本地观察、审批与受控人工操作界面**，不是第四套任务真源。正式任务仍由真实 PR 的
 `coordination/PR-<N>/` 三文件表达，历史状态由 Git commit 保存。
 
 ## 2. 协议区
@@ -100,6 +100,10 @@ Trigger 的自动审批模式不会自动授予 Codex 命令或文件权限。
 本机 `/pair` 通过 `/api/bindings/invite` 生成真实短期一次性 token，复制链接只把 token 放入 URL fragment。
 ChatGPT 无法访问 localhost 时不得编造 token 或链接。
 
+### 2.8 Dashboard 节点人工操作
+
+Dashboard 节点上的人工 action 只表达用户意图，不直接改写 Git/GitHub。当前规划中的 `request_gpt_revision` 通过 active binding 投递到配对 GPT Web 对话；GPT 必须重新读取 GitHub 当前 HEAD 后行动。历史节点只作上下文，用户 action 不自动 fetch、不自动 merge、不授予 Codex shell/file 权限。
+
 ## 3. 当前项目事实
 
 本节只维护当前有效事实，不保存版本历史。
@@ -107,16 +111,19 @@ ChatGPT 无法访问 localhost 时不得编造 token 或链接。
 - 仓库：`yeuei/gpt---github---codex`
 - 默认分支：`main`
 - PR #1：已合并；merge commit `1323dbde24666ed3da8911a9b90a29cf210283be`
-- PR #2：真实开放、独立的“配对链接修复”工作；不是本次 local-first Dashboard 重构的事实真源
-- PR #3：真实开放；标题 `Local-first Dashboard：按 commit SHA 恢复任务并分离状态`
-- PR #3 branch：`refactor/local-git-dashboard`
-- PR #3 主体重构 commit：`baa15b2678454c0a75fecd0e6d670a945c60cf2f`
-- PR #3 CI 修复 commit：`e411794fe79a322bb39cfd90fe0442c880180602`
-- GitHub Actions：run `34077319339` 在 `e411794…` 上真实 `success`
+- PR #2：真实开放、独立的配对链接工作；不是 PR #4 的实现真源
+- PR #3：真实开放；`本地优先 Dashboard：按提交 SHA 恢复任务并分离状态（Local-first Dashboard: Restore Tasks by Commit SHA and Separate States）`
+- PR #3 branch：`refactor/local-git-dashboard`；当前 head `d6a677d820276d35786db284768e035b36e13e56`
+- PR #3 最终 GitHub Actions run `34077426736`：`success`
+- PR #4：真实开放；`Dashboard 节点操作：从选中节点向 GPT 发起修改请求（Dashboard Node Actions: Request GPT Revisions from Selected Nodes）`
+- PR #4 branch：`feature/dashboard-node-gpt-actions`
+- PR #4 当前 stacked base：`refactor/local-git-dashboard`；PR #3 合并后应 retarget 到 `main`
+- PR #4 规划 commit：`4929ec361c014462f57c68368c5fcf21b8d5c924`
+- PR #4 当前任务：实现“节点右键 → 用户修改意见 → active binding → GPT → GitHub → 显式刷新 → 因果新节点”的闭环
 - Dashboard runtime 真源：`trigger/`
 - Dashboard 默认数据源：本地 Git clone + 本地 SQLite
 - 显式网络入口：Dashboard “从 GitHub 刷新” / `python trigger/trigger.py --refresh-once`
-- 用户本机 Chrome / Open Browser Use / Codex app-server 在本次远程收口中**未重新复验**，不得由 CI 结果代替
+- PR #4 尚无 Local Agent 本机实现/E2E 证据，不得把规划 commit 或 CI 冒充成功实现
 
 ## 4. 阅读路径
 
