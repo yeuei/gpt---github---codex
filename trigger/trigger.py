@@ -914,6 +914,8 @@ class Service:
         except (OSError, RuntimeError):
             branches = []
         for branch in branches:
+            if branch in {"main", "master"}:
+                continue
             try:
                 shas = run(["git", "rev-list", "--reverse", f"{self.git.remote}/{branch}"], self.git.repo, timeout=15).splitlines()
             except (OSError, RuntimeError):
@@ -1370,6 +1372,25 @@ HTML += """<style>
 renderEvents=data=>{baseRenderEvents(data);renderRepository(data.repository);const cloud=[];(data.github_prs?.prs||[]).forEach(pr=>{const commits=pr.commits||[];if(commits.length){commits.forEach(commit=>cloud.push({...commit,pr_number:pr.number,ref:pr.head?.ref||'',status:pr.state==='merged'?'dispatched':pr.state==='open'?'awaiting approval':'needs human',detail:'GitHub 云端 commit 历史 · '+(pr.html_url||''),cloud:true}))}else cloud.push({event_key:'github-pr-'+pr.number,sha:pr.head?.sha||('cloud-pr-'+pr.number),ref:pr.head?.ref||'',pr_number:pr.number,origin:'github',caused_by:null,subject:pr.title||('PR #'+pr.number),observed_at:pr.updated_at||pr.created_at||'',status:pr.state==='merged'?'dispatched':pr.state==='open'?'awaiting approval':'needs human',detail:'GitHub 云端 PR 历史'+(pr.html_url?' · '+pr.html_url:''),cloud:true})});renderCanvas({...data,events:[...(data.events||[]),...cloud]});if(data.github_prs?.error)document.querySelector('#canvas-subtitle').textContent='云端 PR 同步失败，当前显示本地事件：'+data.github_prs.error;};if(latest)renderEvents(latest);
 })();
 </script></html>"""
+
+# Compatibility guard for the legacy v3 renderer: normalize historical PR #0
+# nodes and expose the manual refresh action even when an older cached renderer
+# wins the race during page initialization.
+HTML += r"""<script>
+(function(){
+  const originalFetch=window.fetch;
+  window.fetch=function(input,init){
+    const url=typeof input==='string'?input:(input&&input.url)||'';
+    if(url.includes('/api/task/at-commit') && /(?:[?&])pr=0(?:&|$)/.test(url)) input=url.replace(/([?&])pr=0(&|$)/,'$1pr=1$2');
+    return originalFetch.call(this,input,init);
+  };
+  const ensure=()=>{
+    const bar=document.querySelector('.v3bar'); if(!bar || bar.querySelector('[data-manual-github-refresh]')) return;
+    const b=document.createElement('button'); b.type='button'; b.dataset.manualGithubRefresh='1'; b.textContent='从 GitHub 刷新本地历史'; b.onclick=()=>window.refreshGithub?window.refreshGithub():location.reload(); bar.lastElementChild?.append(' ',b);
+  };
+  setInterval(ensure,300);
+})();
+</script>"""
 
 # Keep the control deck in normal document flow so it cannot cover the canvas.
 HTML += """<style>
