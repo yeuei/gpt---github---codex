@@ -428,7 +428,7 @@ class GitSource:
         wanted = set(self.watch_branches)
         return [name for name in refs if name.removeprefix(f"{self.remote}/") in wanted]
 
-    def sync_remote_refs(self) -> list[str]:
+    def sync_remote_refs(self, discover: bool = False) -> list[str]:
         """Refresh tracked remote branches without wildcard fetch/prune.
 
         GitHub HTTPS occasionally stalls while negotiating a full repository
@@ -440,7 +440,7 @@ class GitSource:
         # Dashboard is already watching. New branches are discovered by the
         # authenticated PR API path or on the next successful sync.
         branches = [name.removeprefix(f"{self.remote}/") for name in self.refs()]
-        if not branches:
+        if discover or not branches:
             try:
                 raw = run(["git", "ls-remote", "--heads", self.remote], self.repo, timeout=30)
             except Exception as exc:
@@ -796,7 +796,7 @@ class Service:
             timestamp, cached, error = self._github_cache
             if force:
                 try:
-                    self.git.sync_remote_refs()
+                    self.git.sync_remote_refs(discover=True)
                     local = self._local_pr_history()
                     self._github_cache = (time.monotonic(), local, "")
                     return {"prs": local, "error": "", "source": "local-git-refresh"}
@@ -927,6 +927,7 @@ class Service:
                 origin_match, event_match, cause_match = ORIGIN_RE.search(message), EVENT_RE.search(message), CAUSE_RE.search(message)
                 try:
                     tree = run(["git", "ls-tree", "-r", "--name-only", sha], self.git.repo, timeout=10)
+                    tree = tree.replace('"', '')
                     numbers.update(int(match.group(1)) for match in re.finditer(r"coordination/PR-([1-9][0-9]*)/任务\.md$", tree, re.MULTILINE))
                 except (OSError, RuntimeError, ValueError):
                     pass
