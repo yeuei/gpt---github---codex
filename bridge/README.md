@@ -30,8 +30,10 @@ curl http://127.0.0.1:48765/.well-known/oauth-authorization-server
 
 ## 连接 ChatGPT 网页
 
-ChatGPT 的 MCP 连接器需要一个公网 HTTPS 地址。先安装 Cloudflare 的
-`cloudflared`（它不需要把 PAT 写入 Cloudflare），然后可以直接运行：
+ChatGPT 的 MCP 连接器需要一个公网 HTTPS 地址。`start_quick_tunnel.sh` 会优先
+使用 PATH 中的 `cloudflared`，也会自动识别本机 Codex 私有目录
+`/Users/fy/.codex/bin/cloudflared` 的副本。它不需要把 PAT 写入 Cloudflare。
+没有该工具时，再按 Cloudflare 官方方式安装，然后运行：
 
 ```bash
 ./start_quick_tunnel.sh

@@ -2,7 +2,14 @@
 set -euo pipefail
 
 bridge_root="$(cd "$(dirname "$0")" && pwd)"
-if ! command -v cloudflared >/dev/null 2>&1; then
+cloudflared_bin="${CLOUDFLARED_BIN:-}"
+if [[ -z "$cloudflared_bin" ]] && command -v cloudflared >/dev/null 2>&1; then
+  cloudflared_bin="$(command -v cloudflared)"
+fi
+if [[ -z "$cloudflared_bin" && -x "/Users/fy/.codex/bin/cloudflared" ]]; then
+  cloudflared_bin="/Users/fy/.codex/bin/cloudflared"
+fi
+if [[ -z "$cloudflared_bin" || ! -x "$cloudflared_bin" ]]; then
   echo "cloudflared is required. Install it from https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/downloads/" >&2
   exit 2
 fi
@@ -20,7 +27,7 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-cloudflared tunnel --url "http://127.0.0.1:$port" >"$log_file" 2>&1 &
+"$cloudflared_bin" tunnel --url "http://127.0.0.1:$port" >"$log_file" 2>&1 &
 tunnel_pid=$!
 public_url=""
 for _ in {1..30}; do
@@ -36,7 +43,7 @@ fi
 
 echo "ChatGPT MCP endpoint: $public_url/mcp"
 echo "Open the endpoint in ChatGPT; the OAuth page will ask for the Bridge pairing code."
-BRIDGE_PUBLIC_URL="$public_url" BRIDGE_PORT="$port" GITEE_MCP_URL="${GITEE_MCP_URL:-https://api.gitee.com/mcp}" \
+PYTHONUNBUFFERED=1 BRIDGE_PUBLIC_URL="$public_url" BRIDGE_PORT="$port" GITEE_MCP_URL="${GITEE_MCP_URL:-https://api.gitee.com/mcp}" \
   python3 "$bridge_root/gitee_bridge.py" &
 bridge_pid=$!
 wait "$bridge_pid"
