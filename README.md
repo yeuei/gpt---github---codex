@@ -148,3 +148,11 @@ http://127.0.0.1:8765/pair
 ```
 
 测试与可复现命令见 `trigger/README.md`。
+
+## 6. ChatGPT 网页 ↔ Gitee MCP Bridge
+
+`bridge/` 提供一个本地 OAuth 2.1 + PKCE MCP 网关：ChatGPT 网页连接
+`/mcp`，网关再使用本机的 `GITEE_ACCESS_TOKEN` 转发到 Gitee 官方远程 MCP。
+PAT 不写入仓库，也不会返回给 ChatGPT。开发测试可按
+[`bridge/README.md`](bridge/README.md) 运行 `start_quick_tunnel.sh`；稳定使用时
+请改用固定域名的 Cloudflare named tunnel。
