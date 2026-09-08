@@ -4,7 +4,7 @@ import json
 import os
 import unittest
 
-from gitee_bridge import Config, OAuthStore, PairingManager, Policy, _pkce_s256
+from gitee_bridge import Bridge, Config, OAuthStore, PairingManager, Policy, _pkce_s256
 
 
 class BridgeUnitTests(unittest.TestCase):
@@ -13,11 +13,13 @@ class BridgeUnitTests(unittest.TestCase):
             "host": "127.0.0.1",
             "port": 48765,
             "upstream_url": "https://api.gitee.com/mcp",
+            "gitee_api_url": "https://gitee.com/api/v5",
             "public_url": "https://bridge.example.test",
             "gitee_token": "dummy",
             "allowed_repositories": frozenset({"yeuei/gpt---github---codex"}),
             "allowed_tools": frozenset(),
             "pairing_code": "ABCD2345",
+            "write_enabled": False,
         }
         values.update(overrides)
         return Config(**values)
@@ -48,6 +50,18 @@ class BridgeUnitTests(unittest.TestCase):
         self.assertFalse(policy.allows_arguments({"owner": "someone-else", "repo": "other"}))
         unrestricted = Policy(self.config(allowed_repositories=frozenset()))
         self.assertTrue(unrestricted.allows_arguments({"owner": "someone-else", "repo": "other"}))
+
+    def test_write_tools_require_explicit_enablement_and_confirmation(self):
+        bridge = Bridge(self.config())
+        self.assertEqual([], bridge.write_tools())
+        self.assertEqual(403, bridge.custom_write("create_repository", {"name": "demo", "confirm": True})[0])
+        writable = Bridge(self.config(write_enabled=True))
+        self.assertEqual(4, len(writable.write_tools()))
+        self.assertEqual(400, writable.custom_write("create_repository", {"name": "demo"})[0])
+
+    def test_plain_text_content_is_encoded_once(self):
+        bridge = Bridge(self.config())
+        self.assertEqual("5L2g5aW9", bridge.text_content("你好"))
 
 
 if __name__ == "__main__":

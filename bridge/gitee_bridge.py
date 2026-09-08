@@ -27,6 +27,7 @@ from typing import Any, Dict, Iterable, Optional, Tuple
 
 
 DEFAULT_UPSTREAM = "https://api.gitee.com/mcp"
+DEFAULT_GITEE_API = "https://gitee.com/api/v5"
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 48765
 PAIRING_TTL_SECONDS = 5 * 60
@@ -34,6 +35,7 @@ AUTH_CODE_TTL_SECONDS = 5 * 60
 ACCESS_TOKEN_TTL_SECONDS = 60 * 60
 REFRESH_TOKEN_TTL_SECONDS = 30 * 24 * 60 * 60
 SAFE_TOOL_RE = re.compile(r"^(?:get|list|search|find|check|view|read|show|compare|count|fetch)_[a-z0-9_]+$")
+WRITE_TOOL_NAMES = frozenset({"create_repository", "create_branch", "create_or_update_file", "commit_files"})
 
 
 def _csv(value: str) -> set[str]:
@@ -58,11 +60,13 @@ class Config:
     host: str
     port: int
     upstream_url: str
+    gitee_api_url: str
     public_url: str
     gitee_token: str
     allowed_repositories: frozenset[str]
     allowed_tools: frozenset[str]
     pairing_code: str
+    write_enabled: bool
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -74,11 +78,13 @@ class Config:
             host=os.environ.get("BRIDGE_HOST", DEFAULT_HOST),
             port=int(os.environ.get("BRIDGE_PORT", str(DEFAULT_PORT))),
             upstream_url=os.environ.get("GITEE_MCP_URL", DEFAULT_UPSTREAM).rstrip("/"),
+            gitee_api_url=os.environ.get("GITEE_API_URL", DEFAULT_GITEE_API).rstrip("/"),
             public_url=public_url,
             gitee_token=os.environ.get("GITEE_ACCESS_TOKEN", "").strip(),
             allowed_repositories=frozenset(_csv(os.environ.get("BRIDGE_ALLOWED_REPOSITORIES", ""))),
             allowed_tools=frozenset(_csv(os.environ.get("BRIDGE_ALLOWED_TOOLS", ""))),
             pairing_code=pairing or "".join(secrets.choice("ABCDEFGHJKLMNPQRSTUVWXYZ23456789") for _ in range(8)),
+            write_enabled=os.environ.get("BRIDGE_WRITE_ENABLED", "").strip().lower() in {"1", "true", "yes"},
         )
 
 
@@ -180,8 +186,11 @@ class Policy:
     def __init__(self, config: Config) -> None:
         self.repositories = config.allowed_repositories
         self.tools = config.allowed_tools
+        self.write_enabled = config.write_enabled
 
     def allows_tool(self, name: str) -> bool:
+        if name in WRITE_TOOL_NAMES:
+            return self.write_enabled and (not self.tools or name in self.tools)
         if self.tools:
             return name in self.tools
         return bool(SAFE_TOOL_RE.fullmatch(name))
@@ -238,6 +247,125 @@ class Bridge:
     def protected_resource(self, handler: BaseHTTPRequestHandler) -> dict[str, Any]:
         base = self.base_url(handler)
         return {"resource": f"{base}/mcp", "authorization_servers": [base], "scopes_supported": ["mcp"]}
+
+    def write_tools(self) -> list[dict[str, Any]]:
+        """Tools implemented by this Bridge via Gitee's V5 REST API.
+
+        They are deliberately absent until BRIDGE_WRITE_ENABLED=1.  The Gitee
+        remote MCP currently exposes read tools only, so forwarding it cannot
+        create repositories or commits.
+        """
+        if not self.config.write_enabled:
+            return []
+        confirmation = {"type": "boolean", "description": "Must be true after the user has explicitly approved this write operation."}
+        return [
+            {
+                "name": "create_repository",
+                "description": "Create a Gitee repository for the authenticated user. This writes remotely; set confirm=true only after explicit user approval.",
+                "inputSchema": {"type": "object", "required": ["name", "confirm"], "properties": {"name": {"type": "string"}, "description": {"type": "string"}, "private": {"type": "boolean"}, "auto_init": {"type": "boolean", "description": "Initialize the repository with its first commit; defaults to true."}, "has_issues": {"type": "boolean"}, "has_wiki": {"type": "boolean"}, "confirm": confirmation}},
+            },
+            {
+                "name": "create_branch",
+                "description": "Create a branch from an existing Gitee branch. This writes remotely; set confirm=true only after explicit user approval.",
+                "inputSchema": {"type": "object", "required": ["owner", "repo", "branch", "from_branch", "confirm"], "properties": {"owner": {"type": "string"}, "repo": {"type": "string"}, "branch": {"type": "string"}, "from_branch": {"type": "string"}, "confirm": confirmation}},
+            },
+            {
+                "name": "create_or_update_file",
+                "description": "Create or update one UTF-8 text file and commit it. content is plain text: do not Base64-encode it. This writes remotely; set confirm=true only after explicit user approval.",
+                "inputSchema": {"type": "object", "required": ["owner", "repo", "path", "content", "message", "confirm"], "properties": {"owner": {"type": "string"}, "repo": {"type": "string"}, "path": {"type": "string"}, "content": {"type": "string"}, "message": {"type": "string"}, "branch": {"type": "string"}, "sha": {"type": "string", "description": "Optional current file SHA; otherwise the Bridge looks it up for updates."}, "confirm": confirmation}},
+            },
+            {
+                "name": "commit_files",
+                "description": "Commit multiple file changes in one Gitee commit. Every files[].content value is plain UTF-8 text, not Base64. This writes remotely; set confirm=true only after explicit user approval.",
+                "inputSchema": {"type": "object", "required": ["owner", "repo", "branch", "message", "files", "confirm"], "properties": {"owner": {"type": "string"}, "repo": {"type": "string"}, "branch": {"type": "string"}, "message": {"type": "string"}, "files": {"type": "array", "minItems": 1, "maxItems": 100, "items": {"type": "object", "required": ["path"], "properties": {"path": {"type": "string"}, "content": {"type": "string"}, "action": {"type": "string", "enum": ["create", "update", "delete"]}, "sha": {"type": "string"}}}}, "confirm": confirmation}},
+            },
+        ]
+
+    def gitee_api(self, method: str, path: str, payload: Optional[dict[str, Any]] = None) -> tuple[int, Any]:
+        if not self.config.gitee_token:
+            return 503, {"error": "GITEE_ACCESS_TOKEN is not configured"}
+        data = _json_bytes(payload) if payload is not None else None
+        request = urllib.request.Request(
+            f"{self.config.gitee_api_url}{path}",
+            data=data,
+            headers={"Authorization": f"Bearer {self.config.gitee_token}", "Accept": "application/json", "Content-Type": "application/json"},
+            method=method,
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=60) as response:
+                body = response.read()
+                return response.status, json.loads(body) if body else {}
+        except urllib.error.HTTPError as exc:
+            body = exc.read()
+            try:
+                return exc.code, json.loads(body) if body else {"error": exc.reason}
+            except json.JSONDecodeError:
+                return exc.code, {"error": exc.reason}
+        except (urllib.error.URLError, TimeoutError) as exc:
+            return 502, {"error": "Gitee API unavailable", "detail": str(exc.reason if isinstance(exc, urllib.error.URLError) else exc)}
+
+    @staticmethod
+    def api_path(*segments: str) -> str:
+        return "/" + "/".join(urllib.parse.quote(segment, safe="/") for segment in segments)
+
+    @staticmethod
+    def text_content(value: str) -> str:
+        return base64.b64encode(value.encode("utf-8")).decode("ascii")
+
+    def custom_write(self, name: str, arguments: dict[str, Any]) -> tuple[int, Any]:
+        if not self.config.write_enabled:
+            return 403, {"error": "Bridge write tools are disabled; set BRIDGE_WRITE_ENABLED=1 and restart the Bridge."}
+        if arguments.get("confirm") is not True:
+            return 400, {"error": "confirm must be true for a remote write operation"}
+        if name == "create_repository":
+            payload = {key: arguments[key] for key in ("name", "description", "private", "has_issues", "has_wiki") if key in arguments}
+            payload["auto_init"] = arguments.get("auto_init", True)
+            return self.gitee_api("POST", "/user/repos", payload)
+        owner, repo = str(arguments.get("owner", "")), str(arguments.get("repo", ""))
+        if not owner or not repo:
+            return 400, {"error": "owner and repo are required"}
+        repo_path = self.api_path("repos", owner, repo)
+        if name == "create_branch":
+            return self.gitee_api("POST", f"{repo_path}/branches", {"branch_name": arguments.get("branch"), "refs": arguments.get("from_branch")})
+        if name == "create_or_update_file":
+            path = str(arguments.get("path", "")).strip("/")
+            if not path:
+                return 400, {"error": "path is required"}
+            branch = arguments.get("branch")
+            sha = arguments.get("sha")
+            encoded_path = self.api_path("repos", owner, repo, "contents", path)
+            if not sha:
+                lookup_path = encoded_path + ("?" + urllib.parse.urlencode({"ref": branch}) if branch else "")
+                lookup_status, lookup = self.gitee_api("GET", lookup_path)
+                if 200 <= lookup_status < 300 and isinstance(lookup, dict):
+                    sha = lookup.get("sha")
+            payload = {"content": self.text_content(str(arguments.get("content", ""))), "message": arguments.get("message"), "branch": branch}
+            payload = {key: value for key, value in payload.items() if value is not None}
+            if sha:
+                payload["sha"] = sha
+                return self.gitee_api("PUT", encoded_path, payload)
+            return self.gitee_api("POST", encoded_path, payload)
+        if name == "commit_files":
+            files = arguments.get("files")
+            if not isinstance(files, list) or not files or len(files) > 100:
+                return 400, {"error": "files must contain 1 to 100 entries"}
+            actions = []
+            for item in files:
+                if not isinstance(item, dict) or not isinstance(item.get("path"), str) or not item["path"].strip("/"):
+                    return 400, {"error": "each file requires a non-empty path"}
+                action = item.get("action", "create")
+                if action not in {"create", "update", "delete"}:
+                    return 400, {"error": "file action must be create, update, or delete"}
+                change: dict[str, Any] = {"action": action, "path": item["path"].strip("/")}
+                if action != "delete":
+                    if not isinstance(item.get("content"), str):
+                        return 400, {"error": "non-delete file actions require plain-text content"}
+                    change["content"] = self.text_content(item["content"])
+                if item.get("sha"):
+                    change["sha"] = item["sha"]
+                actions.append(change)
+            return self.gitee_api("POST", f"{repo_path}/commits", {"branch": arguments.get("branch"), "message": arguments.get("message"), "actions": actions})
+        return 404, {"error": f"Unknown custom tool: {name}"}
 
     def upstream(self, method: str, body: Optional[bytes], headers: Dict[str, str]) -> Tuple[int, Dict[str, str], bytes]:
         if not self.config.gitee_token:
@@ -306,7 +434,7 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
         path = urllib.parse.urlsplit(self.path).path
         if path == "/health":
-            self.send_json(200, {"ok": True, "service": "gitee-chatgpt-bridge", "upstream": self.bridge.config.upstream_url, "gitee_token_configured": bool(self.bridge.config.gitee_token), "pairing_required": not self.bridge.pairing.used})
+            self.send_json(200, {"ok": True, "service": "gitee-chatgpt-bridge", "upstream": self.bridge.config.upstream_url, "gitee_token_configured": bool(self.bridge.config.gitee_token), "write_enabled": self.bridge.config.write_enabled, "pairing_required": not self.bridge.pairing.used})
             return
         if path == "/":
             body = "<h1>Gitee ChatGPT Bridge</h1><p>Use <code>/mcp</code> as the ChatGPT connector endpoint.</p><p>The one-time pairing code is printed only in the local Bridge terminal.</p>"
@@ -433,6 +561,14 @@ class Handler(BaseHTTPRequestHandler):
             params = payload.get("params") if isinstance(payload.get("params"), dict) else {}
             tool = str(params.get("name", ""))
             arguments = params.get("arguments", {})
+            if tool in WRITE_TOOL_NAMES:
+                if not isinstance(arguments, dict):
+                    self.send_json(400, {"jsonrpc": "2.0", "id": payload.get("id"), "error": {"code": -32602, "message": "Tool arguments must be an object"}})
+                    return
+                status, result = self.bridge.custom_write(tool, arguments)
+                response = {"jsonrpc": "2.0", "id": payload.get("id"), "result": {"content": [{"type": "text", "text": json.dumps(result, ensure_ascii=False)}], "isError": not 200 <= status < 300}}
+                self.send_json(status, response)
+                return
             if not self.bridge.policy.allows_tool(tool):
                 self.send_json(403, {"jsonrpc": "2.0", "id": payload.get("id"), "error": {"code": -32001, "message": "Tool is not allowed by bridge policy"}})
                 return
@@ -446,6 +582,12 @@ class Handler(BaseHTTPRequestHandler):
                 response_payload = json.loads(response_body)
                 if isinstance(payload, dict) and payload.get("method") == "tools/list":
                     response_payload = self.bridge.policy.filter_tools(response_payload)
+                    result = response_payload.get("result") if isinstance(response_payload, dict) else None
+                    if isinstance(result, dict):
+                        result = dict(result)
+                        result["tools"] = list(result.get("tools", [])) + self.bridge.write_tools()
+                        response_payload = dict(response_payload)
+                        response_payload["result"] = result
                 response_body = _json_bytes(response_payload)
             except json.JSONDecodeError:
                 pass
@@ -459,7 +601,7 @@ def main() -> None:
     server.bridge = bridge  # type: ignore[attr-defined]
     print(f"Gitee ChatGPT Bridge listening on http://{config.host}:{config.port}")
     print(f"Pairing code: {config.pairing_code} (expires in {PAIRING_TTL_SECONDS // 60} minutes)")
-    print(f"Upstream: {config.upstream_url}; token configured: {'yes' if config.gitee_token else 'no'}")
+    print(f"Upstream: {config.upstream_url}; token configured: {'yes' if config.gitee_token else 'no'}; write tools: {'enabled' if config.write_enabled else 'disabled'}")
     try:
         server.serve_forever()
     except KeyboardInterrupt:

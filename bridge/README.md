@@ -21,6 +21,23 @@ export GITEE_ACCESS_TOKEN='你的 Gitee PAT'
 - `BRIDGE_ALLOWED_REPOSITORIES`：可选的仓库白名单；不设置时允许所有仓库，适合作为多个网页版 GPT 的通用入口；
 - `GITEE_MCP_URL`：默认 `https://api.gitee.com/mcp`。
 
+## 受控写入工具
+
+Gitee 官方远程 MCP 当前只提供读取工具。Bridge 额外实现了 Gitee V5 API 的
+`create_repository`、`create_branch`、`create_or_update_file` 和 `commit_files`
+（一次提交最多 100 个文件），但默认关闭。确认需要让已配对的 ChatGPT 写入 Gitee
+后，才在启动 Bridge 的终端设置：
+
+```bash
+export BRIDGE_WRITE_ENABLED=1
+```
+
+每个写工具仍要求 `confirm: true`。`content` 始终传纯文本，Bridge 负责进行一次
+Base64 编码。不要以为“工具出现了”就已经获得了 Gitee 写权限：当前
+`GITEE_ACCESS_TOKEN` 必须是能调用 Gitee V5 API 的 OAuth access token；可先执行
+`GET https://gitee.com/api/v5/user` 验证。若返回 `Access token is wrong type`，请在
+Gitee 重新创建适用于 API/OAuth 的访问令牌并更新环境变量后重启 Bridge。
+
 本地检查：
 
 ```bash
@@ -62,6 +79,8 @@ https://<随机名>.trycloudflare.com/mcp
 - 动态客户端注册只保存内存状态；Bridge 重启后需重新连接。
 - 默认仅转发只读工具；`BRIDGE_ALLOWED_TOOLS` 可进一步收窄工具权限，仓库默认不限制，
   也可通过 `BRIDGE_ALLOWED_REPOSITORIES` 手动收窄。
+- 写工具默认禁用，且要求每次请求带 `confirm: true`；开启后会直接调用 Gitee V5
+  REST API，而不是伪装成上游官方 MCP 已提供的写工具。
 - 日志不打印 URL 查询参数、Authorization 或请求体。
 
 运行测试：
