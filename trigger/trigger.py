@@ -577,8 +577,8 @@ class OpenBrowserUse:
         evaluated = result.get("result", {}) if isinstance(result, dict) else {}
         return evaluated.get("value")
 
-    def attach_unique_chatgpt_tab(self) -> dict[str, Any]:
-        """Claim exactly one OBU-visible ChatGPT conversation tab.
+    def attach_unique_chatgpt_tab(self, *, open_if_missing: bool = False) -> dict[str, Any]:
+        """Claim exactly one OBU-visible ChatGPT tab, optionally creating it.
 
         A continuation must never guess between conversations or create a
         second tab.  ``getUserTabs`` is intentionally the sole inventory: it
@@ -596,17 +596,28 @@ class OpenBrowserUse:
         candidates = []
         for tab in tabs:
             url = str(tab.get("url", ""))
-            match = re.match(r"https://(?:chatgpt\.com|chat\.openai\.com)/c/([^/?#]+)", url)
-            if match:
-                candidates.append((tab, match.group(1)))
+            if re.match(r"https://(?:chatgpt\.com|chat\.openai\.com)(?:/|$)", url):
+                candidates.append((tab, re.match(r"https://(?:chatgpt\.com|chat\.openai\.com)/c/([^/?#]+)", url)))
         if not candidates:
-            raise RuntimeError("未找到受 Open Browser Use 控制的 ChatGPT 对话标签；请只连接一个 /c/ 会话后重试")
+            if not open_if_missing:
+                raise RuntimeError("未找到受 Open Browser Use 控制的 ChatGPT 对话标签")
+            opened = self._rpc(["open-browser-use", "open-tab", *common, "--url", "https://chatgpt.com/"], "open ChatGPT tab")
+            tab_id = opened.get("tabId") if isinstance(opened, dict) else None
+            if tab_id is None and isinstance(opened, dict): tab_id = opened.get("tab", {}).get("id")
+            if not isinstance(tab_id, int): raise RuntimeError(f"could not read opened ChatGPT tab id: {opened}")
+            run(["open-browser-use", "finalize-tabs", *common, "--keep", json.dumps([{"tabId": tab_id, "status": "handoff"}])], timeout=15)
+            return {"tab_id": tab_id, "conversation_id": None, "conversation_title": "", "conversation_url": "https://chatgpt.com/", "needs_conversation": True, "opened": True}
         if len(candidates) != 1:
-            raise RuntimeError(f"发现 {len(candidates)} 个受 Open Browser Use 控制的 ChatGPT 对话标签；请只保留一个后重试")
-        tab, conversation_id = candidates[0]
+            raise RuntimeError(f"发现 {len(candidates)} 个受 Open Browser Use 控制的 ChatGPT 标签；请只保留一个后重试")
+        tab, match = candidates[0]
         tab_id = tab.get("id")
         if not isinstance(tab_id, int):
             raise RuntimeError("ChatGPT tab has no numeric tab id")
+        url = str(tab.get("url", ""))
+        if not match:
+            run(["open-browser-use", "finalize-tabs", *common, "--keep", json.dumps([{"tabId": tab_id, "status": "handoff"}])], timeout=15)
+            return {"tab_id": tab_id, "conversation_id": None, "conversation_title": "", "conversation_url": url, "needs_conversation": True, "opened": False}
+        conversation_id = match.group(1)
         try:
             self._rpc(["open-browser-use", "claim-tab", *common, "--tab-id", str(tab_id)], "claim ChatGPT tab")
         except RuntimeError as exc:
@@ -620,12 +631,13 @@ class OpenBrowserUse:
         if not title:
             title = str(tab.get("title", "")).strip()
             title = re.sub(r"\s*(?:[-|]\s*)?ChatGPT\s*$", "", title, flags=re.I).strip()
-        url = str(tab.get("url", ""))
         run(["open-browser-use", "finalize-tabs", *common, "--keep", json.dumps([{"tabId": tab_id, "status": "handoff"}])], timeout=15)
-        return {"tab_id": tab_id, "conversation_id": conversation_id, "conversation_title": title or "未命名 ChatGPT 对话", "conversation_url": url}
+        return {"tab_id": tab_id, "conversation_id": conversation_id, "conversation_title": title or "未命名 ChatGPT 对话", "conversation_url": url, "needs_conversation": False, "opened": False}
 
     def dispatch(self, message: str, submit: bool) -> str:
         attached = self.attach_unique_chatgpt_tab()
+        if attached.get("needs_conversation"):
+            raise RuntimeError("唯一受控 GPT 标签尚未进入具体对话；请先选择或新建会话")
         url = attached["conversation_url"]
         configured = self.chat.get("conversation_url", "")
         if configured and "REPLACE_" not in configured and configured != url:
@@ -697,7 +709,12 @@ class Service:
     def open_gpt(self) -> dict[str, Any]:
         """Attach the one user-selected OBU ChatGPT tab and expose bind metadata."""
         try:
-            attached = self.browser.attach_unique_chatgpt_tab()
+            attached = self.browser.attach_unique_chatgpt_tab(open_if_missing=True)
+            if attached.get("needs_conversation"):
+                self.browser_status = {"state": "connected", "label": "GPT 标签已打开", "checked_at": now(),
+                                       "target": f"{self.browser.chat.get('browser','chrome')}:{self.browser.chat.get('profile','Default')}",
+                                       "detail": "请在此唯一标签中选择或新建对话，然后再次点击“打开 GPT”读取绑定信息", "conversation": attached}
+                return {"ok": True, **attached}
             # Runtime-only: do not silently alter config.local.json.
             self.config["chatgpt"]["conversation_url"] = attached["conversation_url"]
             self.browser.chat["conversation_url"] = attached["conversation_url"]
