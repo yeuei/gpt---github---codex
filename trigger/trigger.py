@@ -644,6 +644,8 @@ class Service:
     def __init__(self, config: dict[str, Any], store: Store):
         self.config, self.store = config, store; self.git, self.browser = GitSource(config), OpenBrowserUse(config)
         self.last_local_error = ""; self.last_refresh_error = ""; self.last_refresh_at: str | None = None
+        self.cache_dir = self.git.repo / ".cache"
+        self.branch_cache_path = self.cache_dir / "dashboard-branch-cache.json"
         self.browser_status = {"state": "unknown", "label": "未检测", "checked_at": None, "target": f"{self.browser.chat.get('browser','chrome')}:{self.browser.chat.get('profile','Default')}", "detail": "尚未执行连接检测"}
 
     def auto_mode(self) -> bool: return bool(not self.store.setting("approval_required") and self.store.setting("auto_submit"))
@@ -657,6 +659,101 @@ class Service:
         return {"name": self.config.get("repository", ""), "local_path": str(self.git.repo), "remote": self.git.remote, "watch_branches": watched, "local_head": head, "local_branch": branch, "source_mode": "local_git_default", "can_switch_live": False, "last_refresh_at": self.last_refresh_at, "last_refresh_error": self.last_refresh_error}
 
     def check_browser(self) -> dict[str, Any]: self.browser_status = self.browser.check_connection(); return self.browser_status
+
+    def cache_branch_tasks(self) -> dict[str, Any]:
+        """Persist every visible branch's complete local history and task snapshots.
+
+        This reads Git objects only.  Network synchronization remains an explicit
+        user action in ``refresh_from_github``.
+        """
+        branches: list[dict[str, Any]] = []
+        # Prefer the remote-tracking ref when a local branch points at the same
+        # named GitHub branch; otherwise the Dashboard would show duplicates.
+        refs = self.git.refs()
+        remote_refs = {ref.removeprefix(f"{self.git.remote}/") for ref in refs if ref.startswith(f"{self.git.remote}/")}
+        refs = [ref for ref in refs if ref.startswith(f"{self.git.remote}/") or ref not in remote_refs]
+        for ref in refs:
+            try:
+                head = run(["git", "rev-parse", ref], self.git.repo)
+                changed_paths = run(["git", "-c", "core.quotepath=false", "log", "--format=", "--name-only", ref, "--", "coordination"], self.git.repo).splitlines()
+            except RuntimeError:
+                continue
+            # Only show commits introduced by this branch.  Otherwise every
+            # stacked branch repeats all of its ancestors in the canvas.
+            ancestors: list[tuple[int, str]] = []
+            for candidate in refs:
+                if candidate == ref:
+                    continue
+                try:
+                    if run(["git", "rev-parse", candidate], self.git.repo) == head:
+                        continue
+                    run(["git", "merge-base", "--is-ancestor", candidate, ref], self.git.repo)
+                    distance = int(run(["git", "rev-list", "--count", f"{candidate}..{ref}"], self.git.repo))
+                    ancestors.append((distance, candidate))
+                except (RuntimeError, ValueError):
+                    continue
+            base_ref = min(ancestors)[1] if ancestors else None
+            try:
+                history_range = f"{base_ref}..{ref}" if base_ref else ref
+                raw_log = run(["git", "log", "--reverse", "--format=%H%x1f%s%x1f%B%x1e", history_range], self.git.repo)
+            except RuntimeError:
+                raw_log = ""
+            paths = sorted({path for path in changed_paths if re.fullmatch(r"coordination/PR-([1-9][0-9]*)/任务\.md", path)})
+            commits: list[dict[str, Any]] = []
+            for record in raw_log.split("\x1e"):
+                parts = record.strip().split("\x1f", 2)
+                if len(parts) != 3:
+                    continue
+                sha, subject, body = parts
+                origin_match, event_match, cause_match = ORIGIN_RE.search(body), EVENT_RE.search(body), CAUSE_RE.search(body)
+                snapshots: list[dict[str, Any]] = []
+                for path in paths:
+                    try:
+                        content = run(["git", "show", f"{sha}:{path}"], self.git.repo)[:30000]
+                    except RuntimeError:
+                        continue
+                    pr_match = re.fullmatch(r"coordination/PR-([1-9][0-9]*)/任务\.md", path)
+                    if pr_match:
+                        snapshots.append({"pr_number": int(pr_match.group(1)), "path": path, "content": content, **parse_task_markdown(content)})
+                commits.append({"sha": sha, "subject": subject, "origin": origin_match.group(1).lower() if origin_match else "other", "event_key": event_match.group(1) if event_match else f"commit:{sha}", "caused_by": cause_match.group(1) if cause_match else None, "tasks": snapshots})
+            tasks: list[dict[str, Any]] = []
+            for path in paths:
+                try:
+                    content = run(["git", "show", f"{ref}:{path}"], self.git.repo)
+                except RuntimeError:
+                    continue
+                match = re.fullmatch(r"coordination/PR-([1-9][0-9]*)/任务\.md", path)
+                if not match:
+                    continue
+                content = content[:30000]
+                tasks.append({"pr_number": int(match.group(1)), "path": path, "content": content, **parse_task_markdown(content)})
+            # A branch's current tree can contain inherited PR directories.
+            # Label its lane only from task snapshots introduced by this branch,
+            # with an explicit ``prN`` branch name as a fallback.
+            introduced_prs = [task["pr_number"] for commit in commits for task in commit["tasks"]]
+            name_match = re.search(r"(?:^|[-_/])pr[-_]?([1-9][0-9]*)(?:$|[-_/])", ref, re.IGNORECASE)
+            if name_match:
+                primary_pr = int(name_match.group(1))
+            elif ref.removeprefix(f"{self.git.remote}/").startswith("feature/"):
+                primary_pr = max(introduced_prs, default=None)
+            else:
+                primary_pr = None
+            branches.append({"ref": ref, "head": head, "base_ref": base_ref, "primary_pr": primary_pr, "tasks": tasks, "nodes": commits})
+        payload = {"cached_at": now(), "branches": branches}
+        self.cache_dir.mkdir(parents=True, exist_ok=True)
+        temporary = self.branch_cache_path.with_suffix(".tmp")
+        temporary.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+        temporary.replace(self.branch_cache_path)
+        return payload
+
+    def branch_cache(self) -> dict[str, Any]:
+        try:
+            data = json.loads(self.branch_cache_path.read_text(encoding="utf-8"))
+            if isinstance(data, dict) and isinstance(data.get("branches"), list):
+                return data
+        except (OSError, json.JSONDecodeError):
+            pass
+        return {"cached_at": None, "branches": []}
 
     def _text_field(self, payload: dict[str, Any], key: str, minimum: int = 1, maximum: int = 200) -> str:
         value = payload.get(key)
@@ -791,6 +888,7 @@ class Service:
                 head, commits = self.git.poll(ref, self.store.cursor(ref))
                 for commit in commits: self.handle(commit, ref)
                 self.store.set_cursor(ref, head); observed.append({"ref": ref, "commits": len(commits), "head": head})
+            self.cache_branch_tasks()
             self.last_local_error = ""; return {"ok": True, "source": "local_git", "refs": observed, "commits": sum(item["commits"] for item in observed)}
         except Exception as exc:
             self.last_local_error = str(exc); return {"ok": False, "source": "local_git", "error": self.last_local_error}
@@ -809,12 +907,13 @@ class Service:
         try: run(["git", "fetch", self.git.remote, "--prune", "--quiet"], self.git.repo, timeout=60)
         except Exception as exc:
             self.last_refresh_error = str(exc); self.last_refresh_at = now(); return {"ok": False, "source": "github_refresh", "error": self.last_refresh_error, "local_state_preserved": True}
-        pr_warning = self._refresh_pr_states(); self.last_refresh_error = ""; self.last_refresh_at = now(); scanned = self.scan_local(); return {"ok": scanned.get("ok", False), "source": "github_refresh", "fetched": True, "pr_state_warning": pr_warning, "scan": scanned, "refreshed_at": self.last_refresh_at}
+        pr_warning = self._refresh_pr_states(); self.last_refresh_error = ""; self.last_refresh_at = now(); scanned = self.scan_local(); cache = self.cache_branch_tasks(); return {"ok": scanned.get("ok", False), "source": "github_refresh", "fetched": True, "pr_state_warning": pr_warning, "scan": scanned, "cached_branches": len(cache["branches"]), "refreshed_at": self.last_refresh_at}
 
     def poll_once(self) -> dict[str, Any]: return self.scan_local()
 
     def status(self) -> dict[str, Any]:
-        data = self.store.snapshot(); data.update({"repository": self.repository_status(), "browser": self.browser_status, "auto_mode": self.auto_mode(), "last_local_error": self.last_local_error, "last_refresh_error": self.last_refresh_error, "app_approvals": pending_approval_requests()}); return data
+        cache = self.branch_cache()
+        data = self.store.snapshot(); data.update({"repository": self.repository_status(), "browser": self.browser_status, "auto_mode": self.auto_mode(), "last_local_error": self.last_local_error, "last_refresh_error": self.last_refresh_error, "app_approvals": pending_approval_requests(), "branch_cache": {"cached_at": cache.get("cached_at"), "branch_count": len(cache.get("branches", []))}}); return data
 
 
 def handler(service: Service):
@@ -833,6 +932,7 @@ def handler(service: Service):
             if parsed.path == "/api/status": return self.reply(200, service.status())
             if parsed.path == "/api/approvals": return self.reply(200, {"requests": pending_approval_requests()})
             if parsed.path == "/api/bindings": return self.reply(200, {"ok": True, "bindings": service.store.list_bindings(service.config.get("repository", ""))})
+            if parsed.path == "/api/cache/branches": return self.reply(200, {"ok": True, **service.branch_cache()})
             if parsed.path == "/api/task/snapshot":
                 q = parse_qs(parsed.query); raw_pr = q.get("pr", [""])[0]; sha = q.get("sha", [""])[0]; pr = int(raw_pr) if re.fullmatch(r"[1-9][0-9]*", raw_pr) else None; return self.reply(200, service.task_snapshot(pr, sha))
             if parsed.path == "/api/task/current":

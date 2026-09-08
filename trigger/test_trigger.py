@@ -99,6 +99,19 @@ class RuntimeTests(unittest.TestCase):
         self.assertIn("old", snap["content"]); self.assertNotIn("new", snap["content"])
         self.assertNotEqual(first, second)
 
+    def test_local_scan_caches_task_files_for_every_visible_branch(self):
+        self.commit_task(7, "# [ ] PR #7 总任务\n- [ ] T7.1 cached\n")
+        git(self.repo, "branch", "feature/cache-test")
+        result = self.service.scan_local()
+        self.assertTrue(result["ok"])
+        cached = self.service.branch_cache()
+        names = {item["ref"] for item in cached["branches"]}
+        self.assertIn("main", names)
+        self.assertIn("feature/cache-test", names)
+        self.assertTrue(any(task["pr_number"] == 7 for item in cached["branches"] for task in item["tasks"]))
+        node = next(node for item in cached["branches"] for node in item["nodes"] if node["sha"] == git(self.repo, "rev-parse", "HEAD"))
+        self.assertTrue(any(task["pr_number"] == 7 for task in node["tasks"]))
+
     def test_missing_historical_snapshot_never_falls_back_to_current(self):
         before = git(self.repo, "rev-parse", "HEAD")
         self.commit_task(3, "# [ ] PR #3 总任务\n- [x] T3.1 current\n")
@@ -149,7 +162,7 @@ class StaticContractTests(unittest.TestCase):
         self.assertNotIn("event_time", html)
         self.assertNotIn("/api/task/history", html)
         self.assertIn("/api/task/snapshot?pr=", html)
-        self.assertIn("历史任务快照不可用", html)
+        self.assertIn("读取精确快照", html)
 
     def test_refresh_is_explicit_and_background_loop_is_local(self):
         runtime = (HERE / "trigger.py").read_text(encoding="utf-8")
@@ -161,8 +174,11 @@ class StaticContractTests(unittest.TestCase):
 
     def test_pair_link_uses_fragment(self):
         html = (HERE / "dashboard.html").read_text(encoding="utf-8")
-        self.assertIn("/pair#${q}", html)
-        self.assertIn("/api/bindings/invite", html)
+        self.assertIn("快速配对", html)
+        self.assertIn("/api/bindings/claim", html)
+        self.assertIn("/api/bindings/confirm", html)
+        self.assertIn("显示其他来源", html)
+        self.assertIn("/api/cache/branches", html)
 
 
 if __name__ == "__main__":
