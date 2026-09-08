@@ -309,7 +309,7 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json(200, {"ok": True, "service": "gitee-chatgpt-bridge", "upstream": self.bridge.config.upstream_url, "gitee_token_configured": bool(self.bridge.config.gitee_token), "pairing_required": not self.bridge.pairing.used})
             return
         if path == "/":
-            body = "<h1>Gitee ChatGPT Bridge</h1><p>Use <code>/mcp</code> as the ChatGPT connector endpoint.</p><p>Pairing code: <code>%s</code></p>" % html.escape(self.bridge.pairing.code)
+            body = "<h1>Gitee ChatGPT Bridge</h1><p>Use <code>/mcp</code> as the ChatGPT connector endpoint.</p><p>The one-time pairing code is printed only in the local Bridge terminal.</p>"
             self.send_bytes(200, body.encode(), "text/html; charset=utf-8")
             return
         if path == "/.well-known/oauth-protected-resource/mcp":
