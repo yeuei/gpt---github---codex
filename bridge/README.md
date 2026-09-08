@@ -9,7 +9,6 @@ Gitee PAT 只从 `GITEE_ACCESS_TOKEN` 环境变量读取，不写入仓库或网
 ```bash
 cd bridge
 export GITEE_ACCESS_TOKEN='你的 Gitee PAT'
-export BRIDGE_ALLOWED_REPOSITORIES='yeuei/gpt---github---codex'
 ./start_bridge.sh
 ```
 
@@ -19,6 +18,7 @@ export BRIDGE_ALLOWED_REPOSITORIES='yeuei/gpt---github---codex'
 - `BRIDGE_PUBLIC_URL`：Cloudflare Tunnel 的 HTTPS URL，不带结尾 `/`；
 - `BRIDGE_PAIRING_CODE`：自定义 8 位配对码；不设置则启动时随机生成；
 - `BRIDGE_ALLOWED_TOOLS`：逗号分隔白名单；不设置时只放行 `get/list/search/...` 等只读命名；
+- `BRIDGE_ALLOWED_REPOSITORIES`：可选的仓库白名单；不设置时允许所有仓库，适合作为多个网页版 GPT 的通用入口；
 - `GITEE_MCP_URL`：默认 `https://api.gitee.com/mcp`。
 
 本地检查：
@@ -58,8 +58,8 @@ https://<随机名>.trycloudflare.com/mcp
 
 - MCP `/mcp` 需要 Bridge 自己签发的 OAuth access token；Gitee PAT 不会返回给客户端。
 - 动态客户端注册只保存内存状态；Bridge 重启后需重新连接。
-- 默认仅转发只读工具；`BRIDGE_ALLOWED_TOOLS` 和 `BRIDGE_ALLOWED_REPOSITORIES`
-  可进一步收窄权限。
+- 默认仅转发只读工具；`BRIDGE_ALLOWED_TOOLS` 可进一步收窄工具权限，仓库默认不限制，
+  也可通过 `BRIDGE_ALLOWED_REPOSITORIES` 手动收窄。
 - 日志不打印 URL 查询参数、Authorization 或请求体。
 
 运行测试：
