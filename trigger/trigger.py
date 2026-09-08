@@ -25,8 +25,6 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, unquote, urlparse
-from urllib.parse import urlencode
-from urllib.request import Request, urlopen
 
 ROOT = Path(__file__).resolve().parent
 DEFAULT_CONFIG = ROOT / "config.local.json"
