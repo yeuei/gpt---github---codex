@@ -577,27 +577,61 @@ class OpenBrowserUse:
         evaluated = result.get("result", {}) if isinstance(result, dict) else {}
         return evaluated.get("value")
 
+    def attach_unique_chatgpt_tab(self) -> dict[str, Any]:
+        """Claim exactly one OBU-visible ChatGPT conversation tab.
+
+        A continuation must never guess between conversations or create a
+        second tab.  ``getUserTabs`` is intentionally the sole inventory: it
+        only returns tabs Open Browser Use can control for this session.
+        """
+        common = self._common()
+        self._ping(common)
+        result = self._rpc(
+            ["open-browser-use", "call", *common, "--method", "getUserTabs", "--params", "{}"],
+            "getUserTabs",
+        )
+        tabs = result.get("tabs", []) if isinstance(result, dict) else result
+        if not isinstance(tabs, list):
+            raise RuntimeError("getUserTabs returned an invalid tab list")
+        candidates = []
+        for tab in tabs:
+            url = str(tab.get("url", ""))
+            match = re.match(r"https://(?:chatgpt\.com|chat\.openai\.com)/c/([^/?#]+)", url)
+            if match:
+                candidates.append((tab, match.group(1)))
+        if not candidates:
+            raise RuntimeError("未找到受 Open Browser Use 控制的 ChatGPT 对话标签；请只连接一个 /c/ 会话后重试")
+        if len(candidates) != 1:
+            raise RuntimeError(f"发现 {len(candidates)} 个受 Open Browser Use 控制的 ChatGPT 对话标签；请只保留一个后重试")
+        tab, conversation_id = candidates[0]
+        tab_id = tab.get("id")
+        if not isinstance(tab_id, int):
+            raise RuntimeError("ChatGPT tab has no numeric tab id")
+        try:
+            self._rpc(["open-browser-use", "claim-tab", *common, "--tab-id", str(tab_id)], "claim ChatGPT tab")
+        except RuntimeError as exc:
+            if f"already part of browser session {self.session_id}" not in str(exc):
+                raise
+        try:
+            title = str(self._evaluate(common, tab_id, "document.title") or "").strip()
+        except Exception:
+            title = ""
+        title = re.sub(r"\s*(?:[-|]\s*)?ChatGPT\s*$", "", title, flags=re.I).strip()
+        if not title:
+            title = str(tab.get("title", "")).strip()
+            title = re.sub(r"\s*(?:[-|]\s*)?ChatGPT\s*$", "", title, flags=re.I).strip()
+        url = str(tab.get("url", ""))
+        run(["open-browser-use", "finalize-tabs", *common, "--keep", json.dumps([{"tabId": tab_id, "status": "handoff"}])], timeout=15)
+        return {"tab_id": tab_id, "conversation_id": conversation_id, "conversation_title": title or "未命名 ChatGPT 对话", "conversation_url": url}
+
     def dispatch(self, message: str, submit: bool) -> str:
-        url = self.chat.get("conversation_url", "")
-        if "REPLACE_" in url or not url.startswith("https://chatgpt.com/"):
-            raise RuntimeError("configure chatgpt.conversation_url before enabling agent -> ChatGPT")
-        common = self._common(); self._ping(common)
-        tabs_result = self._rpc(["open-browser-use", "call", *common, "--method", "getUserTabs", "--params", "{}"], "getUserTabs")
-        tabs = tabs_result.get("tabs", []) if isinstance(tabs_result, dict) else tabs_result
-        if not isinstance(tabs, list): raise RuntimeError("getUserTabs returned an invalid tab list")
-        matching = [tab for tab in tabs if tab.get("url") == url]
-        if matching:
-            tab_id = matching[-1]["id"]
-            try:
-                self._rpc(["open-browser-use", "claim-tab", *common, "--tab-id", str(tab_id)], "claim ChatGPT tab")
-            except RuntimeError as exc:
-                if f"already part of browser session {self.session_id}" not in str(exc): raise
-        else:
-            opened = self._rpc(["open-browser-use", "open-tab", *common, "--url", url], "open ChatGPT tab")
-            candidate = opened.get("tabId") if isinstance(opened, dict) else None
-            if candidate is None and isinstance(opened, dict): candidate = opened.get("tab", {}).get("id")
-            if not isinstance(candidate, int): raise RuntimeError(f"could not read opened tab id: {opened}")
-            tab_id = candidate
+        attached = self.attach_unique_chatgpt_tab()
+        url = attached["conversation_url"]
+        configured = self.chat.get("conversation_url", "")
+        if configured and "REPLACE_" not in configured and configured != url:
+            raise RuntimeError("唯一受控 ChatGPT 标签与已绑定的会话不一致；请重新执行“打开 GPT”后再继续")
+        self.chat["conversation_url"] = url
+        common = self._common(); tab_id = attached["tab_id"]
         editor = '#prompt-textarea[contenteditable="true"]'; handoff_ready = False
         try:
             before = self._evaluate(common, tab_id, """(() => {const e=document.querySelector(%s);if(!e)throw new Error('ChatGPT composer not found');const f=document.querySelector('textarea[placeholder="问问 ChatGPT"], textarea.wcDTda_fallbackTextarea');const text=(e.innerText||e.textContent||f?.value||'').trim();e.focus();return {draftLength:text.length,draftText:text};})()""" % json.dumps(editor))
@@ -660,6 +694,46 @@ class Service:
 
     def check_browser(self) -> dict[str, Any]: self.browser_status = self.browser.check_connection(); return self.browser_status
 
+    def open_gpt(self) -> dict[str, Any]:
+        """Attach the one user-selected OBU ChatGPT tab and expose bind metadata."""
+        try:
+            attached = self.browser.attach_unique_chatgpt_tab()
+            # Runtime-only: do not silently alter config.local.json.
+            self.config["chatgpt"]["conversation_url"] = attached["conversation_url"]
+            self.browser.chat["conversation_url"] = attached["conversation_url"]
+            self.browser_status = {"state": "connected", "label": "已绑定唯一 GPT 会话", "checked_at": now(),
+                                   "target": f"{self.browser.chat.get('browser','chrome')}:{self.browser.chat.get('profile','Default')}",
+                                   "detail": f"{attached['conversation_title']} · {attached['conversation_id']}", "conversation": attached}
+            return {"ok": True, **attached}
+        except Exception as exc:
+            self.browser_status = {"state": "disconnected", "label": "GPT 会话未绑定", "checked_at": now(),
+                                   "target": f"{self.browser.chat.get('browser','chrome')}:{self.browser.chat.get('profile','Default')}", "detail": str(exc)[:500]}
+            return {"ok": False, "error": str(exc)[:500]}
+
+    def continue_pr(self, pr_number: int) -> dict[str, Any]:
+        """Prepare, but never send, the latest local handoff context for a PR."""
+        if not isinstance(pr_number, int) or pr_number < 1:
+            return {"ok": False, "error": "invalid PR number"}
+        cache = self.branch_cache()
+        candidates = [branch for branch in cache.get("branches", []) if branch.get("primary_pr") == pr_number]
+        if not candidates:
+            return {"ok": False, "error": f"本地缓存中没有 PR #{pr_number} 的交接轨道"}
+        branch = max(candidates, key=lambda item: len(item.get("nodes", [])))
+        state = str(branch.get("pr_state", "unknown")).lower()
+        if state in {"closed", "merged"}:
+            return {"ok": False, "closed": True, "error": f"PR #{pr_number} 已{'合并' if state == 'merged' else '关闭'}，不能继续交接"}
+        nodes = branch.get("nodes", [])
+        latest = nodes[-1] if nodes else {"sha": branch.get("head", ""), "subject": "当前分支 HEAD", "tasks": []}
+        task = next((item for item in reversed(latest.get("tasks", [])) if item.get("pr_number") == pr_number), None)
+        if task is None:
+            task = next((item for item in branch.get("tasks", []) if item.get("pr_number") == pr_number), None)
+        branch_name = str(branch.get("ref", "")).removeprefix(f"{self.git.remote}/")
+        binding = next((item for item in self.store.list_bindings(self.config.get("repository", ""))
+                        if item.get("status") == "active" and item.get("branch") == branch_name and item.get("pr_number") == pr_number), None)
+        return {"ok": True, "pr_number": pr_number, "ref": branch.get("ref"), "head": branch.get("head"),
+                "pr_state": state, "latest": latest, "task": task, "binding": binding,
+                "message": "已准备最新本地交接上下文；请先人工审阅，再在唯一 GPT 会话中继续。"}
+
     def cache_branch_tasks(self) -> dict[str, Any]:
         """Persist every visible branch's complete local history and task snapshots.
 
@@ -667,6 +741,7 @@ class Service:
         user action in ``refresh_from_github``.
         """
         branches: list[dict[str, Any]] = []
+        pr_states = self.store.setting("github_pr_states") or {}
         # Prefer the remote-tracking ref when a local branch points at the same
         # named GitHub branch; otherwise the Dashboard would show duplicates.
         refs = self.git.refs()
@@ -732,13 +807,19 @@ class Service:
             # with an explicit ``prN`` branch name as a fallback.
             introduced_prs = [task["pr_number"] for commit in commits for task in commit["tasks"]]
             name_match = re.search(r"(?:^|[-_/])pr[-_]?([1-9][0-9]*)(?:$|[-_/])", ref, re.IGNORECASE)
+            short_ref = ref.removeprefix(f"{self.git.remote}/")
             if name_match:
                 primary_pr = int(name_match.group(1))
-            elif ref.removeprefix(f"{self.git.remote}/").startswith("feature/"):
+            elif short_ref in {"main", "master"}:
+                primary_pr = None
+            elif introduced_prs:
                 primary_pr = max(introduced_prs, default=None)
             else:
                 primary_pr = None
-            branches.append({"ref": ref, "head": head, "base_ref": base_ref, "primary_pr": primary_pr, "tasks": tasks, "nodes": commits})
+            cached_state = pr_states.get(str(primary_pr), {}) if primary_pr is not None else {}
+            branches.append({"ref": ref, "head": head, "base_ref": base_ref, "primary_pr": primary_pr,
+                             "pr_state": cached_state.get("state", "unknown"), "pr_state_source": cached_state.get("source", "not_synced"),
+                             "tasks": tasks, "nodes": commits})
         payload = {"cached_at": now(), "branches": branches}
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         temporary = self.branch_cache_path.with_suffix(".tmp")
@@ -944,6 +1025,12 @@ def handler(service: Service):
             if self.path in {"/api/scan-local", "/api/poll"}: return self.reply(200, service.scan_local())
             if self.path == "/api/refresh-github": return self.reply(200, service.refresh_from_github())
             if self.path == "/api/browser/check": return self.reply(200, service.check_browser())
+            if self.path == "/api/browser/open-gpt":
+                result = service.open_gpt(); return self.reply(200 if result.get("ok") else 409, result)
+            if self.path.startswith("/api/pr/") and self.path.endswith("/continue"):
+                raw_pr = self.path[len("/api/pr/"):-len("/continue")].rstrip("/")
+                if not re.fullmatch(r"[1-9][0-9]*", raw_pr): return self.reply(400, {"ok": False, "error": "invalid PR number"})
+                result = service.continue_pr(int(raw_pr)); return self.reply(200 if result.get("ok") else 409, result)
             if self.path == "/api/mode":
                 data = self.read_json()
                 if not data or not isinstance(data.get("auto"), bool): return self.reply(400, {"error": "invalid auto mode"})
