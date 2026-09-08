@@ -211,6 +211,11 @@ class Store:
             row = self.db.execute("select * from events where event_key=?", (event_key,)).fetchone()
         return dict(row) if row else None
 
+    def latest_for_pr(self, pr_number: int) -> dict[str, Any] | None:
+        with self.lock:
+            row = self.db.execute("select * from events where pr_number=? order by id desc limit 1", (pr_number,)).fetchone()
+        return dict(row) if row else None
+
     def pending_events(self) -> list[dict[str, Any]]:
         """Return events waiting for the explicit approval gate.
 
@@ -696,7 +701,7 @@ class OpenBrowserUse:
             # Keep the broker session alive for subsequent events. The trigger
             # is a long-running local service, not a one-shot browser turn.
 
-    def open_chatgpt(self) -> str:
+    def open_chatgpt(self) -> dict[str, Any]:
         """Open the configured ChatGPT conversation without editing or submitting."""
         # Debug navigation is intentionally independent from event dispatch:
         # an empty conversation_url opens the ChatGPT home page, while the
@@ -724,17 +729,27 @@ class OpenBrowserUse:
         # Inspect existing tabs first. The dashboard must not create a second
         # ChatGPT tab when OBU already controls one for this target.
         _, tabs_body = mcp_post({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"user_tabs","arguments":{}}}, session)
-        if url:
+        def extract_tabs(body: str) -> list[dict[str, Any]]:
             try:
-                tabs_payload = json.loads(tabs_body)
-                tabs_text = tabs_payload.get("result", {}).get("content", [{}])[0].get("text", "")
-                if url in tabs_text:
-                    return "已存在由 Open Browser Use 接管的 ChatGPT 页面，未新建标签页"
+                raw = body.split("data:", 1)[1].strip() if "data:" in body else body
+                outer = json.loads(raw)
+                text = outer.get("result", {}).get("content", [{}])[0].get("text", "")
+                inner = json.loads(text)
+                return inner.get("result", []) if isinstance(inner, dict) else []
             except (ValueError, TypeError, AttributeError, IndexError):
-                pass
+                return []
+        tabs = extract_tabs(tabs_body)
+        existing = next((tab for tab in tabs if re.search(r"https://chatgpt\.com/c/[^/?#]+", str(tab.get("url", "")))), None)
+        existing = existing or next((tab for tab in tabs if str(tab.get("url", "")).startswith("https://chatgpt.com")), None)
+        if existing:
+            return {"message": "已存在由 Open Browser Use 接管的 ChatGPT 页面，未新建标签页", "tab": existing,
+                    "web_conversation_id": (re.search(r"/c/([^/?#]+)", str(existing.get("url", ""))) or [None, ""])[1],
+                    "web_conversation_title": existing.get("title", "")}
         _, body = mcp_post({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"open_tab","arguments":{"url":url}}}, session)
         if '"error"' in body: raise RuntimeError(body[:500])
-        return "已通过 Windows OBU MCP 打开 ChatGPT"
+        return {"message": "已通过 Windows OBU MCP 打开 ChatGPT", "tab": {"url": url},
+                "web_conversation_id": (re.search(r"/c/([^/?#]+)", url) or [None, ""])[1],
+                "web_conversation_title": "ChatGPT"}
 
 
 def parse_task_markdown(content: str) -> dict[str, Any]:
@@ -787,6 +802,43 @@ class Service:
         self._github_cache: tuple[float, list[dict[str, Any]], str] = (0.0, [], "")
         self._last_git_sync = 0.0
         self._git_sync_interval = 60.0
+        self.cache_dir = self.git.repo / ".cache"
+        self.task_cache_path = self.cache_dir / "task_snapshots.json"
+
+    def _cache_task_snapshots(self, prs: list[dict[str, Any]]) -> dict[str, Any]:
+        """Persist commit-bound task.md snapshots for offline, exact history."""
+        snapshots: dict[str, Any] = {}
+        for pr in prs:
+            number = pr.get("number")
+            if not isinstance(number, int) or number < 1:
+                continue
+            relative = f"coordination/PR-{number}/任务.md"
+            for commit in pr.get("commits", []):
+                sha = str(commit.get("sha") or "")
+                if not re.fullmatch(r"[0-9a-fA-F]{7,64}", sha):
+                    continue
+                try:
+                    content = run(["git", "show", f"{sha}:{relative}"], self.git.repo, timeout=15)
+                except (OSError, RuntimeError):
+                    continue
+                snapshots[sha] = {"pr_number": number, "commit_sha": sha,
+                                  "path": relative, "content": content[:20000],
+                                  "cached_at": now()}
+        try:
+            self.cache_dir.mkdir(parents=True, exist_ok=True)
+            tmp = self.task_cache_path.with_suffix(".tmp")
+            tmp.write_text(json.dumps(snapshots, ensure_ascii=False), encoding="utf-8")
+            tmp.replace(self.task_cache_path)
+        except OSError:
+            pass
+        return snapshots
+
+    def _read_task_cache(self) -> dict[str, Any]:
+        try:
+            data = json.loads(self.task_cache_path.read_text(encoding="utf-8"))
+            return data if isinstance(data, dict) else {}
+        except (OSError, ValueError, TypeError):
+            return {}
 
     def github_prs(self, force: bool = False) -> dict[str, Any]:
         """Read cloud PR history without requiring a local event record.
@@ -800,6 +852,7 @@ class Service:
                 try:
                     self.git.sync_remote_refs(discover=True)
                     local = self._local_pr_history()
+                    self._cache_task_snapshots(local)
                     self._github_cache = (time.monotonic(), local, "")
                     return {"prs": local, "error": "", "source": "local-git-refresh"}
                 except Exception as exc:
@@ -810,6 +863,7 @@ class Service:
             if not force:
                 local = self._local_pr_history()
                 if local:
+                    self._cache_task_snapshots(local)
                     self._github_cache = (time.monotonic(), local, "")
                     return {"prs": local, "error": "", "source": "local-git"}
             if not force and time.monotonic() - timestamp < 30:
@@ -917,7 +971,43 @@ class Service:
             if branch in {"main", "master"}:
                 continue
             try:
-                shas = run(["git", "rev-list", "--reverse", f"{self.git.remote}/{branch}"], self.git.repo, timeout=15).splitlines()
+                # Only commits introduced by this PR branch belong to its
+                # timeline.  For stacked PRs, the nearest ancestor branch is
+                # the correct base; using main would duplicate the parent PR.
+                base_ref = f"{self.git.remote}/main"
+                branch_ref = f"{self.git.remote}/{branch}"
+                candidates = []
+                for other in branches:
+                    if other in {"main", "master", branch}:
+                        continue
+                    other_ref = f"{self.git.remote}/{other}"
+                    try:
+                        run(["git", "merge-base", "--is-ancestor", other_ref, branch_ref], self.git.repo, timeout=10)
+                        stamp = run(["git", "show", "-s", "--format=%ct", other_ref], self.git.repo, timeout=10).strip()
+                        candidates.append((int(stamp or 0), other_ref))
+                    except (OSError, RuntimeError, ValueError):
+                        continue
+                if candidates:
+                    base_ref = max(candidates)[1]
+                base = run(["git", "merge-base", base_ref, branch_ref], self.git.repo, timeout=15).strip()
+                shas = run(["git", "rev-list", "--reverse", f"{base}..{branch_ref}"], self.git.repo, timeout=15).splitlines()
+                if not shas:
+                    # The PR branch may already be merged and deleted from
+                    # the active PR view. Recover its original commits from
+                    # the merge commit's second-parent range.
+                    merges = run(["git", "log", f"{self.git.remote}/main", "--merges", "--format=%H %P %s"], self.git.repo, timeout=15).splitlines()
+                    for line in merges:
+                        parts = line.split(" ", 3)
+                        if len(parts) < 3 or "pull request" not in line.lower():
+                            continue
+                        merge_sha, first_parent, second_parent = parts[:3]
+                        try:
+                            run(["git", "merge-base", "--is-ancestor", branch_ref, second_parent], self.git.repo, timeout=10)
+                            shas = run(["git", "rev-list", "--reverse", f"{first_parent}..{second_parent}"], self.git.repo, timeout=15).splitlines()
+                            if shas:
+                                break
+                        except (OSError, RuntimeError):
+                            continue
             except (OSError, RuntimeError):
                 continue
             commits = []
@@ -1103,7 +1193,20 @@ class Service:
         try:
             content = path.read_text(encoding="utf-8")
         except FileNotFoundError:
-            return {"ok": False, "unassigned": unassigned, "path": relative.as_posix(), "error": "任务.md 不存在"}
+            # PR branches are kept as local remote refs; their task file is
+            # not necessarily checked out in the main worktree. Read the
+            # PR-specific file directly from the matching ref instead of
+            # silently falling back to another PR's current task.
+            branch_map = {1: "feature/local-trigger-v1", 2: "feature/pairing-links-pr2",
+                          3: "refactor/local-git-dashboard", 4: "feature/dashboard-node-gpt-actions"}
+            branch = branch_map.get(pr_number)
+            if branch:
+                try:
+                    content = run(["git", "show", f"{self.git.remote}/{branch}:{relative.as_posix()}"], self.git.repo, timeout=15)
+                except (OSError, RuntimeError):
+                    return {"ok": False, "unassigned": unassigned, "path": relative.as_posix(), "error": "任务.md 不存在"}
+            else:
+                return {"ok": False, "unassigned": unassigned, "path": relative.as_posix(), "error": "任务.md 不存在"}
         except (OSError, UnicodeError):
             return {"ok": False, "unassigned": unassigned, "path": relative.as_posix(), "error": "任务.md 无法读取"}
         truncated = len(content) > 20000
@@ -1133,7 +1236,7 @@ class Service:
         except (OSError, ValueError):
             return {"ok": False, "error": "任务文件路径不在交接仓库内"}
         try:
-            log = run(["git", "log", "--follow", "--format=%H%x09%cI%x09%s", "--", relative.as_posix()], repo)
+            log = run(["git", "log", "--all", "--follow", "--format=%H%x09%cI%x09%s", "--", relative.as_posix()], repo)
         except RuntimeError as exc:
             return {"ok": False, "path": relative.as_posix(), "error": f"本地 Git 历史不可用：{exc}"}
         snapshots: list[dict[str, Any]] = []
@@ -1160,10 +1263,16 @@ class Service:
         if not isinstance(pr_number, int) or pr_number < 1 or not re.fullmatch(r"[0-9a-fA-F]{7,64}", commit_sha or ""):
             return {"ok": False, "error": "invalid PR number or commit SHA"}
         relative = f"coordination/PR-{pr_number}/任务.md"
+        cached = self._read_task_cache().get(commit_sha)
+        if isinstance(cached, dict) and cached.get("pr_number") == pr_number:
+            content = str(cached.get("content") or "")
+            return {"ok": True, "pr_number": pr_number, "path": relative,
+                    "commit_sha": commit_sha, "cache": True, "content": content, **parse_task_markdown(content)}
         try:
             content = run(["git", "show", f"{commit_sha}:{relative}"], self.git.repo, timeout=10)
         except Exception:
-            return {"ok": False, "historical_unavailable": True, "error": "该 commit 中没有可读取的任务.md 历史快照"}
+            return {"ok": False, "historical_unavailable": True, "cache_missing": True,
+                    "error": "本地缓存中没有该 commit 的任务.md；请点击“从 GitHub 刷新本地历史”"}
         return {"ok": True, "pr_number": pr_number, "path": relative,
                 "commit_sha": commit_sha, "content": content, **parse_task_markdown(content)}
 
@@ -1265,6 +1374,15 @@ class Service:
         except Exception as exc:
             self.store.finish(event_key, "needs human", str(exc))
 
+    def continue_pr(self, pr_number: int) -> dict[str, Any]:
+        event = self.store.latest_for_pr(pr_number)
+        if not event:
+            return {"ok": False, "error": f"PR #{pr_number} 没有可继续的本地事件"}
+        if event["status"] not in {"awaiting approval", "needs human", "dispatched"}:
+            return {"ok": False, "error": f"PR #{pr_number} 当前事件状态为 {event['status']}，无法继续"}
+        self.dispatch_event(event["event_key"], allow_fill_only_resubmit=event["status"] == "dispatched")
+        return {"ok": True, "event_key": event["event_key"]}
+
     def poll_once(self) -> dict[str, Any]:
         # Background polling is intentionally local-only. Remote GitHub sync is
         # performed only by the explicit dashboard refresh action.
@@ -1315,7 +1433,7 @@ async function setMode(v){try{const data=await api('/api/mode',{method:'POST',he
 async function poll(){try{const data=await api('/api/poll',{method:'POST'});if(data.error)notice('GitHub 检查失败：'+data.error);else notice('已检查 GitHub；发现 '+data.commits+' 个新提交。')}catch(error){notice('GitHub 检查失败：'+error.message)}await load()}
 async function approve(key){try{await api('/api/approve/'+encodeURIComponent(key),{method:'POST'});notice('事件已提交给触发器处理。')}catch(error){notice('无法处理此事件：'+error.message)}await load()}
 async function checkBrowser(){const box=document.querySelector('#browser');box.textContent='浏览器连接：检测中…';try{renderBrowser(await api('/api/browser/check',{method:'POST'}))}catch(error){notice('浏览器连接检测失败：'+error.message)}}
-function renderBrowser(browser){document.querySelector('#browser').innerHTML=`<span class="health ${esc(browser.state)}">● ${esc(browser.label)}</span><span class="pill">${esc(browser.target||'未配置')}</span><span class="detail">${esc(browser.detail||'')} ${browser.checked_at?'（'+esc(browser.checked_at)+'）':''}</span><button id="open-chatgpt-debug">调试：打开 ChatGPT</button><button id="check-browser">检测浏览器连接</button>`;document.querySelector('#check-browser').addEventListener('click',checkBrowser);document.querySelector('#open-chatgpt-debug').addEventListener('click',async()=>{const b=document.querySelector('#open-chatgpt-debug');b.disabled=true;b.textContent='打开中…';try{const r=await api('/api/browser/open-chatgpt',{method:'POST'});notice(r.message||r.error||'调试操作完成')}catch(e){notice('调试打开 ChatGPT 失败：'+e.message)}finally{b.disabled=false;b.textContent='调试：打开 ChatGPT'}})}
+function renderBrowser(browser){document.querySelector('#browser').innerHTML=`<span class="health ${esc(browser.state)}">● ${esc(browser.label)}</span><span class="pill">${esc(browser.target||'未配置')}</span><span class="detail">${esc(browser.detail||'')} ${browser.checked_at?'（'+esc(browser.checked_at)+'）':''}</span><button id="open-chatgpt-debug">调试：打开 ChatGPT</button><button id="check-browser">检测浏览器连接</button>`;document.querySelector('#check-browser').addEventListener('click',checkBrowser);window.__openChatGPT=async()=>{const b=document.querySelector('#open-chatgpt-debug');if(b)b.disabled=true;if(b)b.textContent='打开中…';try{const r=await api('/api/browser/open-chatgpt',{method:'POST'});notice(r.message||r.error||'调试操作完成');const form=document.querySelector('#repository-connect-form textarea[name="payload"]');if(form&&r.web_conversation_id){form.value='repository='+((latest&&latest.repository&&latest.repository.remote)||'')+'; web_conversation_id='+r.web_conversation_id+'; web_conversation_title='+(r.web_conversation_title||'ChatGPT')}}catch(e){notice('调试打开 ChatGPT 失败：'+e.message)}finally{if(b)b.disabled=false;if(b)b.textContent='调试：打开 ChatGPT'}};document.querySelector('#open-chatgpt-debug').addEventListener('click',window.__openChatGPT)}
 function tone(event){if(event.status==='dispatched')return 'ok';if(event.status==='needs human')return 'danger';return 'warn'}
 function visibleEvents(events){return events.filter(event=>eventFilter==='all'||eventFilter==='action'&&['awaiting approval','needs human'].includes(event.status)||eventFilter==='pending'&&event.status==='awaiting approval'||eventFilter==='human'&&event.status==='needs human'||eventFilter==='done'&&event.status==='dispatched')}
 function renderEvents(data){const events=visibleEvents(data.events), pending=data.events.filter(e=>e.status==='awaiting approval').length, human=data.events.filter(e=>e.status==='needs human').length;document.querySelector('#event-summary').innerHTML=`<span class="summary"><span class="pill">共 ${data.events.length} 个</span><span class="pill ${pending?'warn':'good'}">${pending} 个等待审批</span><span class="pill ${human?'danger':'good'}">${human} 个需要人工处理</span></span>`;const body=document.querySelector('#events');if(!events.length){body.innerHTML='<tr><td class="empty" colspan="6">当前筛选条件下没有事件。</td></tr>';return}body.innerHTML=events.map(event=>{const retry=['awaiting approval','needs human'].includes(event.status),eventId=esc(event.event_key),causedBy=event.caused_by?'<div class="event-meta">由 '+esc(event.caused_by)+' 引起</div>':'';return `<tr><td>${esc(event.observed_at)}</td><td>${event.pr_number==null?'<span class="pill">未关联</span>':'<span class="pill">#'+esc(event.pr_number)+'</span>'}</td><td>${esc(origin[event.origin]||event.origin)}</td><td><strong>${esc(event.sha.slice(0,8))}</strong><div>${esc(event.subject)}</div><div class="event-meta">${eventId}</div><div class="event-meta">${esc(event.ref||'')}</div>${causedBy}</td><td class="status status-${tone(event)}">${esc(status[event.status]||event.status)}</td><td>${esc(event.detail||'—')}${retry?`<br><button class="event-action ${event.status==='needs human'?'danger':'primary'}" data-event-key="${eventId}">${event.status==='needs human'?'修复后重试':'批准此事件'}</button>`:''}</td></tr>`}).join('');body.querySelectorAll('[data-event-key]').forEach(button=>button.addEventListener('click',()=>approve(button.dataset.eventKey)))}
@@ -1363,7 +1481,7 @@ HTML += """<style>
 (function(){
   const controlDeck=document.createElement('section');controlDeck.id='control-deck';controlDeck.setAttribute('aria-labelledby','control-deck-heading');controlDeck.innerHTML='<div class="control-deck-heading"><div><div class="eyebrow">安全控制台</div><h2 id="control-deck-heading">链路控制</h2><p>GitHub 是事件中转；每个方向的开关与审批授权保持独立。</p></div><span class="pill good">本机服务 · 127.0.0.1</span></div>';
   const noticeBox=document.querySelector('#notice'),repositoryCard=document.querySelector('#repository-card'),browserPanel=document.querySelector('#browser').closest('section'),controlsPanel=document.querySelector('#controls').closest('section');[noticeBox,repositoryCard,browserPanel,controlsPanel].forEach((node,index)=>{if(!node)return;if(index>0)node.classList.add('control-deck-section');controlDeck.append(node)});document.querySelector('main header').after(controlDeck);
-  const oldTimeline=document.querySelector('#pr-timeline'),canvasRoot=oldTimeline;oldTimeline.innerHTML='<div class="canvas-toolbar"><div><h2 id="canvas-heading">PR 事件画布</h2><p id="canvas-subtitle">拖拽平移、滚轮缩放；点击事件节点查看完整上下文。</p></div><div class="canvas-actions"><label for="canvas-pr-filter">项目 / PR</label><select id="canvas-pr-filter" aria-label="选择要显示的 PR"></select><span class="canvas-zoom"><button type="button" id="canvas-zoom-out" aria-label="缩小">−</button><output id="canvas-zoom-level">100%</output><button type="button" id="canvas-zoom-in" aria-label="放大">+</button></span><button type="button" id="canvas-fit">适配视图</button><button type="button" id="canvas-reset">重置视图</button></div></div><div class="canvas-layout"><div class="canvas-viewport" id="canvas-viewport" tabindex="0" role="application" aria-label="PR 事件画布，可拖拽平移和滚轮缩放"><div id="canvas-world" class="canvas-world"></div></div><aside id="canvas-detail" class="canvas-detail empty" aria-live="polite"><div>选择一个事件节点<br>查看完整变动、上下文和可用操作</div></aside></div>';oldTimeline.classList.add('canvas-panel');
+  const oldTimeline=document.querySelector('#pr-timeline'),canvasRoot=oldTimeline;oldTimeline.innerHTML='<div class="canvas-toolbar"><div><h2 id="canvas-heading">PR 事件画布</h2><p id="canvas-subtitle">拖拽平移、滚轮缩放；点击事件节点查看完整上下文。</p></div><div class="canvas-actions"><label for="canvas-pr-filter">项目 / PR</label><select id="canvas-pr-filter" aria-label="选择要显示的 PR"></select><button type="button" id="canvas-github-refresh">从 GitHub 刷新本地历史</button><span class="canvas-zoom"><button type="button" id="canvas-zoom-out" aria-label="缩小">−</button><output id="canvas-zoom-level">100%</output><button type="button" id="canvas-zoom-in" aria-label="放大">+</button></span><button type="button" id="canvas-fit">适配视图</button><button type="button" id="canvas-reset">重置视图</button></div></div><div class="canvas-layout"><div class="canvas-viewport" id="canvas-viewport" tabindex="0" role="application" aria-label="PR 事件画布，可拖拽平移和滚轮缩放"><div id="canvas-world" class="canvas-world"></div></div><aside id="canvas-detail" class="canvas-detail empty" aria-live="polite"><div>选择一个事件节点<br>查看完整变动、上下文和可用操作</div></aside></div>';oldTimeline.classList.add('canvas-panel');
   const legacyEvents=document.querySelector('#events-heading').closest('section');legacyEvents.style.display='none';
   const viewport=document.querySelector('#canvas-viewport'),world=document.querySelector('#canvas-world'),detail=document.querySelector('#canvas-detail'),filter=document.querySelector('#canvas-pr-filter'),zoomLevel=document.querySelector('#canvas-zoom-level');let canvasFilter='all',selectedEventKey=null,canvasEventByKey=new Map(),canvasData=null,view={scale:1,x:0,y:0,fit:false,dragging:false,moved:false,startX:0,startY:0,originX:0,originY:0};
   const titleForKey=key=>key.startsWith('pr:')?'PR #'+key.slice(3):key.startsWith('unassigned:chain:')?'未关联 PR · 因果链':'未关联 PR · 独立事件';
@@ -1374,7 +1492,7 @@ HTML += """<style>
   const zoomCanvasAt=(factor,clientX,clientY)=>{const old=view.scale,next=Math.min(2.2,Math.max(.35,old*factor)),rect=viewport.getBoundingClientRect(),px=clientX-rect.left,py=clientY-rect.top;view.x=px-(px-view.x)*(next/old);view.y=py-(py-view.y)*(next/old);view.scale=next;updateTransform()};
   const zoomCanvas=factor=>zoomCanvasAt(factor,viewport.getBoundingClientRect().left+viewport.clientWidth/2,viewport.getBoundingClientRect().top+viewport.clientHeight/2);
   const renderDetail=event=>{if(!event){detail.className='canvas-detail empty';detail.innerHTML='<div>选择一个事件节点<br>查看完整变动、上下文和可用操作</div>';return}const retry=!event.cloud&&['awaiting approval','needs human'].includes(event.status);detail.className='canvas-detail';detail.innerHTML=`<button type="button" class="detail-close" aria-label="关闭详情">×</button><div class="detail-label">${event.pr_number==null?'未关联 PR':'PR #'+esc(event.pr_number)}</div><h3>${esc(event.subject)}</h3><span class="pill ${event.status==='needs human'?'danger':event.status==='awaiting approval'?'warn':'good'}">${esc(status[event.status]||event.status)}</span><div class="detail-label">时间 / 来源</div><div class="detail-value">${esc(event.observed_at)} · ${esc(origin[event.origin]||event.origin)}</div><div class="detail-label">提交 / 分支</div><div class="detail-value">${esc(event.sha)}<br>${esc(event.ref||'未记录分支')}</div><div class="detail-label">Event ID</div><div class="detail-value">${esc(event.event_key)}</div>${event.caused_by?`<div class="detail-label">因果链</div><div class="detail-value">${esc(event.caused_by)}</div>`:''}<div class="detail-label">执行详情</div><div class="detail-value">${esc(event.detail||'暂无详情')}</div>${event.cloud?'<div class="detail-label">数据来源</div><div class="detail-value">GitHub 云端 commit 历史；本地触发器未记录该事件。</div>':''}${retry?`<div class="detail-actions"><button type="button" class="${event.status==='needs human'?'danger':'primary'}" data-canvas-event-action="${esc(event.event_key)}">${event.status==='needs human'?'修复后重试':'批准此事件'}</button></div>`:''}`;detail.querySelector('.detail-close').addEventListener('click',()=>{selectedEventKey=null;renderDetail(null);document.querySelectorAll('.canvas-node').forEach(node=>node.classList.remove('is-selected'))});const action=detail.querySelector('[data-canvas-event-action]');if(action)action.addEventListener('click',()=>approve(action.dataset.canvasEventAction));window.dispatchEvent(new Event('canvas-selection-changed'));setTimeout(()=>window.__loadTask?.(),0)};
-  const renderCanvas=data=>{canvasData=data;window.__canvasData=data;const allEvents=data.events||[];rememberCanvasEvents(allEvents);window.__canvasEventByKey=canvasEventByKey;const allTracks=canvasTracks(allEvents),tracks=canvasFilter==='all'?allTracks:allTracks.filter(track=>track.key===canvasFilter),options=['<option value="all">全部轨道（'+allTracks.length+'）</option>'].concat(allTracks.map(track=>`<option value="${esc(track.key)}">${esc(track.title)}（${track.events.length} 个事件）</option>`));if(filter.innerHTML!==options.join(''))filter.innerHTML=options.join('');if(!allTracks.some(track=>track.key===canvasFilter)&&canvasFilter!=='all')canvasFilter='all';filter.value=canvasFilter;const width=Math.max(700,...tracks.map(track=>track.events.length*265+80)),height=Math.max(430,tracks.length*190+55);world.style.width=width+'px';world.style.height=height+'px';const positions=new Map;let nodes='';tracks.forEach((track,row)=>{const y=30+row*190;track.events.forEach((event,index)=>{const x=35+index*265;positions.set(event.event_key,{x,y});const toneClass=event.status==='needs human'?'danger':event.status==='awaiting approval'?'warn':'ok';nodes+=`<article class="canvas-node ${selectedEventKey===event.event_key?'is-selected':''}" style="left:${x}px;top:${y}px" data-canvas-node="${esc(event.event_key)}"><button type="button" class="canvas-node-button" aria-label="${esc(track.title+'：'+event.subject)}"><span class="canvas-node-top"><span class="canvas-node-pr">${esc(track.title)}</span><span class="canvas-node-time">${esc(event.observed_at.slice(11,16))}</span></span><span class="canvas-node-title">${esc(event.subject)}</span><span class="canvas-node-meta">${esc(origin[event.origin]||event.origin)} · ${esc(event.sha.slice(0,8))}</span><span class="canvas-node-status ${toneClass}">${esc(status[event.status]||event.status)}</span></button></article>`})});let lines='<svg class="canvas-edges" width="'+width+'" height="'+height+'" aria-hidden="true"><defs><marker id="canvas-arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="#8eafe9"></path></marker></defs>';tracks.forEach(track=>track.edges.forEach(([from,to])=>{const start=positions.get(from),end=positions.get(to);if(start&&end)lines+=`<line class="canvas-edge" marker-end="url(#canvas-arrow)" x1="${start.x+225}" y1="${start.y+59}" x2="${end.x+5}" y2="${end.y+59}"></line>`}));lines+='</svg>';world.innerHTML=tracks.length?lines+nodes:'<div class="canvas-empty"><div><strong>当前筛选条件下没有事件</strong>如需查看其它 PR，请更改上方筛选。</div></div>';world.querySelectorAll('[data-canvas-node]').forEach(node=>node.querySelector('button').addEventListener('click',()=>{selectedEventKey=node.dataset.canvasNode;window.__selectedCanvasEventKey=selectedEventKey;const event=allEvents.find(item=>item.event_key===selectedEventKey);document.querySelectorAll('.canvas-node').forEach(item=>item.classList.toggle('is-selected',item===node));renderDetail(event)}));if(selectedEventKey){const selected=allEvents.find(event=>event.event_key===selectedEventKey);if(selected)renderDetail(selected);else{selectedEventKey=null;renderDetail(null)}}if(!view.fit)requestAnimationFrame(fitCanvas);else updateTransform()};
+  const renderCanvas=data=>{canvasData=data;window.__canvasData=data;const allEvents=data.events||[];rememberCanvasEvents(allEvents);window.__canvasEventByKey=canvasEventByKey;const allTracks=canvasTracks(allEvents),tracks=canvasFilter==='all'?allTracks:allTracks.filter(track=>track.key===canvasFilter),options=['<option value="all">全部轨道（'+allTracks.length+'）</option>'].concat(allTracks.map(track=>`<option value="${esc(track.key)}">${esc(track.title)}（${track.events.length} 个事件）</option>`));if(filter.innerHTML!==options.join(''))filter.innerHTML=options.join('');if(!allTracks.some(track=>track.key===canvasFilter)&&canvasFilter!=='all')canvasFilter='all';filter.value=canvasFilter;const width=Math.max(700,...tracks.map(track=>track.events.length*265+80)),height=Math.max(430,tracks.length*190+55);world.style.width=width+'px';world.style.height=height+'px';const positions=new Map;let nodes='';tracks.forEach((track,row)=>{const y=30+row*190;track.events.forEach((event,index)=>{const x=35+index*265;positions.set(event.event_key,{x,y});const toneClass=event.status==='needs human'?'danger':event.status==='awaiting approval'?'warn':'ok';nodes+=`<article class="canvas-node ${selectedEventKey===event.event_key?'is-selected':''}" style="left:${x}px;top:${y}px" data-canvas-node="${esc(event.event_key)}"><button type="button" class="canvas-node-button" aria-label="${esc(track.title+'：'+event.subject)}"><span class="canvas-node-top"><span class="canvas-node-pr">${esc(track.title)}</span><span class="canvas-node-time">${esc(event.observed_at.slice(11,16))}</span></span><span class="canvas-node-title">${esc(event.subject)}</span><span class="canvas-node-meta">${esc(origin[event.origin]||event.origin)} · ${esc(event.sha.slice(0,8))}</span><span class="canvas-node-status ${toneClass}">${esc(status[event.status]||event.status)}</span></button></article>`});if(/^pr:\d+$/.test(track.key)){const pr=track.key.slice(3);const fx=35+track.events.length*265;nodes+=`<button type="button" class="canvas-track-start primary" data-pr-start="${pr}" style="position:absolute;left:${fx}px;top:${y+38}px">开始 PR #${pr}</button>`}});let lines='<svg class="canvas-edges" width="'+width+'" height="'+height+'" aria-hidden="true"><defs><marker id="canvas-arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="#8eafe9"></path></marker></defs>';tracks.forEach(track=>track.edges.forEach(([from,to])=>{const start=positions.get(from),end=positions.get(to);if(start&&end)lines+=`<line class="canvas-edge" marker-end="url(#canvas-arrow)" x1="${start.x+225}" y1="${start.y+59}" x2="${end.x+5}" y2="${end.y+59}"></line>`}));lines+='</svg>';world.innerHTML=tracks.length?lines+nodes:'<div class="canvas-empty"><div><strong>当前筛选条件下没有事件</strong>如需查看其它 PR，请更改上方筛选。</div></div>';world.querySelectorAll('[data-canvas-node]').forEach(node=>node.querySelector('button').addEventListener('click',()=>{selectedEventKey=node.dataset.canvasNode;window.__selectedCanvasEventKey=selectedEventKey;const event=allEvents.find(item=>item.event_key===selectedEventKey);document.querySelectorAll('.canvas-node').forEach(item=>item.classList.toggle('is-selected',item===node));renderDetail(event)}));world.querySelectorAll('[data-pr-start]').forEach(button=>button.addEventListener('click',async()=>{button.disabled=true;button.textContent='启动中…';try{const result=await api('/api/pr/'+encodeURIComponent(button.dataset.prStart)+'/start',{method:'POST'});notice(result.ok?'已继续 PR #'+button.dataset.prStart+' 的执行':'启动失败：'+(result.error||'未知错误'));if(result.ok)load()}catch(error){notice('启动 PR 失败：'+error.message)}finally{button.disabled=false;button.textContent='开始 PR #'+button.dataset.prStart}}));if(selectedEventKey){const selected=allEvents.find(event=>event.event_key===selectedEventKey);if(selected)renderDetail(selected);else{selectedEventKey=null;renderDetail(null)}}if(!view.fit)requestAnimationFrame(fitCanvas);else updateTransform()};
   window.addEventListener('canvas-filter-changed',event=>{canvasFilter=event.detail||'all';view.fit=false;if(canvasData)renderCanvas(canvasData)});
   viewport.addEventListener('pointerdown',event=>{if(event.target.closest('button'))return;view.dragging=true;view.moved=false;view.startX=event.clientX;view.startY=event.clientY;view.originX=view.x;view.originY=view.y;viewport.classList.add('is-dragging');viewport.setPointerCapture?.(event.pointerId)});viewport.addEventListener('pointermove',event=>{if(!view.dragging)return;const dx=event.clientX-view.startX,dy=event.clientY-view.startY;if(Math.abs(dx)+Math.abs(dy)>3)view.moved=true;view.x=view.originX+dx;view.y=view.originY+dy;updateTransform()});const stopDrag=event=>{if(!view.dragging)return;view.dragging=false;viewport.classList.remove('is-dragging');viewport.releasePointerCapture?.(event.pointerId)};viewport.addEventListener('pointerup',stopDrag);viewport.addEventListener('pointercancel',stopDrag);viewport.addEventListener('wheel',event=>{event.preventDefault();zoomCanvasAt(Math.exp(-Math.max(-120,Math.min(120,event.deltaY))*.0015),event.clientX,event.clientY)},{passive:false});document.querySelector('#canvas-zoom-in').addEventListener('click',()=>zoomCanvas(1.2));document.querySelector('#canvas-zoom-out').addEventListener('click',()=>zoomCanvas(.83));document.querySelector('#canvas-fit').addEventListener('click',fitCanvas);document.querySelector('#canvas-reset').addEventListener('click',()=>{view={scale:1,x:0,y:0,fit:false,dragging:false,moved:false,startX:0,startY:0,originX:0,originY:0};updateTransform();requestAnimationFrame(fitCanvas)});
 renderEvents=data=>{baseRenderEvents(data);renderRepository(data.repository);const cloud=[];(data.github_prs?.prs||[]).forEach(pr=>{const commits=pr.commits||[];if(commits.length){commits.forEach(commit=>cloud.push({...commit,pr_number:pr.number,ref:pr.head?.ref||'',status:pr.state==='merged'?'dispatched':pr.state==='open'?'awaiting approval':'needs human',detail:'GitHub 云端 commit 历史 · '+(pr.html_url||''),cloud:true}))}else cloud.push({event_key:'github-pr-'+pr.number,sha:pr.head?.sha||('cloud-pr-'+pr.number),ref:pr.head?.ref||'',pr_number:pr.number,origin:'github',caused_by:null,subject:pr.title||('PR #'+pr.number),observed_at:pr.updated_at||pr.created_at||'',status:pr.state==='merged'?'dispatched':pr.state==='open'?'awaiting approval':'needs human',detail:'GitHub 云端 PR 历史'+(pr.html_url?' · '+pr.html_url:''),cloud:true})});renderCanvas({...data,events:[...(data.events||[]),...cloud]});if(data.github_prs?.error)document.querySelector('#canvas-subtitle').textContent='云端 PR 同步失败，当前显示本地事件：'+data.github_prs.error;};if(latest)renderEvents(latest);
@@ -1422,7 +1540,10 @@ HTML += """<style>
 @media(max-width:900px){#control-deck{position:relative!important}.canvas-layout{grid-template-columns:1fr}.canvas-viewport{min-height:420px}}
 </style><script>
 (function(){
-  const refresh=document.createElement('button');refresh.type='button';refresh.textContent='从 GitHub 刷新';refresh.addEventListener('click',refreshGithub);window.__githubRefreshButton=refresh;document.querySelector('#canvas-pr-filter')?.after(refresh);
+  const refresh=document.querySelector('#canvas-github-refresh');
+  if(refresh){refresh.type='button';refresh.addEventListener('click',refreshGithub);window.__githubRefreshButton=refresh}
+  const start=document.querySelector('#canvas-start');
+  if(start)start.addEventListener('click',()=>document.querySelector('#open-chatgpt-debug')?.click());
   const detail=document.querySelector('#canvas-detail');
   const taskOpenByEvent=new Map();
   const taskOpenState=eventKey=>{const saved=taskOpenByEvent.get(eventKey);if(saved&&typeof saved==='object')return saved;return {raw:saved===true,other:false}};
@@ -1442,13 +1563,16 @@ HTML += """<style>
     fetch(taskUrl(event)).then(response=>response.json()).then(data=>{
       if(document.querySelector('.canvas-node.is-selected')?.dataset.canvasNode!==event.event_key)return;
       if(!data.ok){panel.innerHTML='<div class="detail-label">任务.md / 交接进度</div><div class="task-summary">'+esc(data.error||'任务.md 不可用')+'</div>';return}
-      return fetch(historyUrl(event)).then(response=>response.json()).catch(()=>({ok:false})).then(history=>{
+      const historyRequest = event.cloud
+        ? fetch('/api/task/at-commit?pr='+encodeURIComponent(event.pr_number)+'&sha='+encodeURIComponent(event.sha)).then(response=>response.json()).catch(()=>({ok:false}))
+        : fetch(historyUrl(event)).then(response=>response.json()).catch(()=>({ok:false}));
+      return historyRequest.then(history=>{
       if(document.querySelector('.canvas-node.is-selected')?.dataset.canvasNode!==event.event_key)return;
       const prefix=data.unassigned?'未关联 PR 的当前 handoff 任务':'PR #'+esc(data.pr_number)+' 的交接任务';
       const open=taskOpenState(event.event_key);
       const completed=data.sections?.flatMap(section=>section.items).filter(item=>item.state==='done').length||0,total=data.sections?.flatMap(section=>section.items).length||0,percent=total?Math.round(completed/total*100):0;
-      const historical=event.cloud?null:matchTaskHistory(history,event);
-      const historyBlock=historical?'<section class="task-history-block"><div class="detail-label">该事件时点的任务进度</div><div class="task-history-meta">匹配方式：'+(historical.match==='commit_sha'?'事件提交 SHA 精确匹配':'按事件时间匹配最近不晚于该事件的提交')+' · '+esc(historical.short_sha||historical.commit_sha?.slice(0,8)||'')+' · '+esc(historical.committed_at||'')+' · '+esc(historical.subject||'')+'</div><div class="task-summary">'+esc(historical.summary)+'</div>'+renderTaskSections(historical,event.event_key,'history',false)+'</section>':'<section class="task-history-block"><div class="detail-label">该事件时点的任务进度</div><div class="task-history-missing">'+(event.cloud?'该节点来自 GitHub 云端 commit；本地没有与该 SHA 对应的任务.md 历史快照。当前任务.md 仍按本地仓库现状显示。':'无历史快照：无法将该事件与不晚于该事件的任务.md 提交可靠关联。')+'</div></section>';
+      const historical=event.cloud?(history.ok?{...history,match:history.cache?'local_cache':'commit_sha',short_sha:String(history.commit_sha||event.sha).slice(0,8),committed_at:event.observed_at,summary:history.summary||''}:null):matchTaskHistory(history,event);
+      const historyBlock=historical?'<section class="task-history-block"><div class="detail-label">该事件时点的任务进度</div><div class="task-history-meta">匹配方式：'+(historical.match==='local_cache'?'本地缓存精确匹配':'事件提交 SHA 精确匹配')+' · '+esc(historical.short_sha||historical.commit_sha?.slice(0,8)||'')+' · '+esc(historical.committed_at||'')+' · '+esc(historical.subject||'')+'</div><div class="task-summary">'+esc(historical.summary)+'</div>'+renderTaskSections(historical,event.event_key,'history',false)+'</section>':'<section class="task-history-block"><div class="detail-label">该事件时点的任务进度</div><div class="task-history-missing">本地缓存中没有该 commit 的任务.md 历史快照，请点击“从 GitHub 刷新本地历史”后重试。不会使用当前任务.md冒充历史状态。</div></section>';
       const currentBlock='<section class="task-current-block"><div class="detail-label">当前最新任务进度</div><div class="task-path">'+prefix+' · '+esc(data.path)+'</div><div class="task-summary '+(data.all_complete?'task-complete-note':'')+'">'+esc(data.summary)+(data.truncated?'（内容已截断）':'')+'</div><div class="task-progress" aria-label="任务完成进度"><span class="task-progress-bar"><i style="width:'+percent+'%"></i></span><span>'+percent+'% 已完成</span></div>'+renderTaskSections(data,event.event_key,'current',true)+'</section>';
       replacePanel(panel,'<div class="detail-label">任务.md / 交接进度</div>'+historyBlock+currentBlock+'<details id="task-document-details"'+(open.raw?' open':'')+'><summary>'+ (open.raw?'收起原始任务.md':'查看原始任务.md（展开完整任务.md）') +'</summary><pre id="task-document-raw">'+esc(data.content)+'</pre></details>');
       const disclosure=panel.querySelector('#task-document-details'),otherDisclosure=panel.querySelector('#task-document-other'),summary=disclosure.querySelector('summary'),otherSummary=otherDisclosure?.querySelector('summary');
@@ -1477,7 +1601,7 @@ HTML += r"""
 <style>
 #pr-timeline{background:#f2f5fa;border-radius:24px;padding:18px}.v3bar{display:flex;justify-content:space-between;align-items:center;gap:12px;margin-bottom:14px}.v3bar h2{margin:0;font-size:20px}.v3bar select,.v3bar button{border:1px solid #d8e0ec;border-radius:12px;background:#fff;padding:9px 12px}.v3layout{display:grid;grid-template-columns:minmax(0,1fr) 360px;gap:14px}.v3canvas{height:calc(100vh - 280px);min-height:560px;overflow:hidden;border-radius:20px;background:radial-gradient(#d7e2f3 1px,transparent 1px),#f8fafd;background-size:22px 22px;cursor:grab;touch-action:none;user-select:none;-webkit-user-select:none}.v3canvas::selection,.v3canvas *::selection{background:transparent;color:inherit}.v3canvas.dragging{cursor:grabbing}.v3stage{transform-origin:0 0;display:flex;flex-direction:column;gap:28px;padding:28px;min-width:max-content;will-change:transform;user-select:none;-webkit-user-select:none}.v3track{display:flex;align-items:center;gap:14px;min-width:max-content}.v3node{width:238px;min-height:150px;padding:15px;border:1px solid #e0e7f1;border-radius:18px;background:rgba(255,255,255,.94);box-shadow:0 8px 22px #1d355715;cursor:pointer;user-select:none;-webkit-user-select:none}.v3node.unknown{opacity:.58}.v3node.selected{border:2px solid #2677f5;box-shadow:0 0 0 4px #2677f526}.v3node h4{margin:0 0 7px;font-size:13px;color:#2677f5}.v3subject{font-weight:700;line-height:1.35}.v3meta{margin-top:8px;color:#748197;font-size:11px;line-height:1.4}.v3badge{display:inline-block;margin-top:9px;padding:4px 8px;border-radius:99px;font-size:11px;font-weight:700}.v3badge.ok{background:#e9f9ef;color:#168451}.v3badge.warn{background:#fff4dc;color:#a96600}.v3badge.err{background:#ffeded;color:#c23838}.v3arrow{color:#8eafe9;font-size:22px;user-select:none;-webkit-user-select:none}.v3detail{height:calc(100vh - 280px);min-height:560px;overflow:auto;border-radius:20px;background:rgba(255,255,255,.9);padding:20px;box-shadow:0 8px 22px #1d355710}.v3detail h3{margin:0 0 8px}.v3section{margin-top:16px;padding-top:14px;border-top:1px solid #e7edf5}.v3task-item{display:flex;gap:9px;align-items:flex-start;padding:9px 10px;margin:7px 0;background:#f7f9fd;border-radius:12px;font-size:13px}.v3task-check{width:20px;height:20px;display:grid;place-items:center;border-radius:7px;background:#e8eef8;color:#748197}.v3task-item.done .v3task-check{background:#ddf5e6;color:#168451}.v3task-progress{height:7px;background:#e7edf5;border-radius:99px;overflow:hidden}.v3task-progress i{display:block;height:100%;background:#35b56c}.v3detail pre{white-space:pre-wrap;background:#f7f9fd;border-radius:12px;padding:12px;font-size:12px}@media(max-width:900px){.v3layout{grid-template-columns:1fr}.v3detail{height:420px;min-height:420px}}
 </style><script>
-(()=>{window.__v3Active=true;const root=document.querySelector('#pr-timeline');if(!root)return;const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));const st={events:[],filter:'all',selected:null,scale:1,x:0,y:0,drag:false,moved:false,sx:0,sy:0,ox:0,oy:0};const status=e=>{if(['needs human','error','failed'].includes(e.status))return ['err','出现错误'];if(e.status==='awaiting approval')return ['warn','等待审批'];if(e.status==='dispatched')return ['ok','自动审批成功'];return ['ok','已记录']};const build=d=>{const a=[...(d.events||[])];(d.github_prs?.prs||[]).forEach(p=>(p.commits||[]).forEach(c=>a.push({...c,pr_number:p.number,ref:p.head?.ref||'',cloud:true,status:p.state==='open'?'awaiting approval':'dispatched',origin:c.origin||'unknown',agent_id:c.agent_id||c.agent||'',gpt_id:c.gpt_id||c.chatgpt_id||''})));return a.sort((a,b)=>String(a.observed_at).localeCompare(String(b.observed_at)))};const apply=()=>{const s=root.querySelector('#v3stage');if(s)s.style.transform='translate3d('+st.x+'px,'+st.y+'px,0) scale('+st.scale+')';const z=root.querySelector('#v3zoom');if(z)z.textContent=Math.round(st.scale*100)+'%'};const task=async e=>{const b=root.querySelector('#v3task');if(!b)return;b.innerHTML='<div class="v3section"><b>任务.md</b><p>读取历史快照中…</p></div>';try{const x=await fetch('/api/task/at-commit?pr='+encodeURIComponent(e.pr_number??'unassigned')+'&sha='+encodeURIComponent(e.sha)).then(r=>r.json());if(!x.ok){b.innerHTML='<div class="v3section"><b>任务.md</b><p>'+esc(x.error||'该 commit 无任务.md 快照')+'</p></div>';return;}const items=(x.sections||[]).flatMap(s=>s.items||[]),done=items.filter(i=>i.state==='done').length,p=items.length?Math.round(done/items.length*100):0;b.innerHTML='<div class="v3section"><b>任务.md · '+esc(x.commit_sha?'历史快照':'当前状态')+'</b><div class="v3meta">'+esc(x.committed_at||x.path||'')+' · '+esc(x.summary||'')+'</div><div class="v3task-progress"><i style="width:'+p+'%"></i></div><div class="v3meta">'+p+'% 已完成</div>'+items.map(i=>'<div class="v3task-item '+(i.state==='done'?'done':'')+'"><span class="v3task-check">'+(i.state==='done'?'✓':'')+'</span><span>'+esc(i.label)+'</span></div>').join('')+'<details><summary>查看原始任务.md</summary><pre>'+esc(x.content||'')+'</pre></details></div>'}catch(err){b.innerHTML='<div class="v3section"><b>任务.md</b><p>读取失败：'+esc(err.message)+'</p></div>'}};const render=()=>{const nums=[...new Set(st.events.filter(e=>e.pr_number!=null).map(e=>e.pr_number))].sort((a,b)=>a-b),events=st.events.filter(e=>(st.filter==='all'||String(e.pr_number)===String(st.filter))&&(st.showUnknown||['agent','chatgpt'].includes(String(e.origin||'').toLowerCase()))),groups=new Map;events.forEach(e=>{const k=e.pr_number??'unassigned';if(!groups.has(k))groups.set(k,[]);groups.get(k).push(e)});root.innerHTML='<div class="v3bar"><h2>PR 事件画布</h2><div><select id="v3filter"><option value="all">全部轨道</option>'+nums.map(n=>'<option value="'+n+'">PR #'+n+'</option>').join('')+'</select> <button id="v3minus">−</button><span id="v3zoom">'+Math.round(st.scale*100)+'%</span><button id="v3plus">+</button><button id="v3fit">适配</button><button id="v3unknown" title="显示/隐藏未知来源节点">'+(st.showUnknown?'◉':'◌')+' 未知</button></div></div><div class="v3layout"><div class="v3canvas" id="v3canvas"><div class="v3stage" id="v3stage">'+([...groups.entries()].map(([k,es])=>'<div class="v3track">'+es.map((e,i)=>{const [tone,label]=status(e),origin=(e.origin||'unknown').toLowerCase(),known=['agent','chatgpt'].includes(origin);return '<div class="v3node '+(known?'':'unknown ') +(st.selected===e.event_key?'selected':'')+'" data-key="'+esc(e.event_key)+'"><h4>PR #'+esc(k)+'</h4><div class="v3subject">'+esc(e.subject)+'</div><div class="v3meta">来源：'+esc(origin.toUpperCase())+'<br>Agent ID：'+esc(e.agent_id||'未记录')+'<br>GPT ID：'+esc(e.gpt_id||'未记录')+'<br>事件：'+esc(e.event_key||e.sha||'unknown')+'</div><span class="v3badge '+tone+'">'+label+'</span></div>'+(i<es.length-1?'<span class="v3arrow">→</span>':'')}).join('')+'</div>').join('')||'<p>当前筛选条件下没有事件</p>')+'</div></div><aside class="v3detail" id="v3detail">'+(st.selected?'<p>加载详情中…</p>':'<p>选择一个节点查看任务.md</p>')+'</aside></div>';const f=root.querySelector('#v3filter');f.value=st.filter;f.onchange=()=>{st.filter=f.value;st.selected=null;render()};root.querySelector('#v3minus').onclick=()=>{st.scale=Math.max(.4,st.scale*.85);apply()};root.querySelector('#v3plus').onclick=()=>{st.scale=Math.min(2.5,st.scale*1.18);apply()};root.querySelector('#v3fit').onclick=()=>{st.scale=1;st.x=20;st.y=20;apply()};root.querySelector('#v3unknown').onclick=()=>{st.showUnknown=!st.showUnknown;st.selected=null;render()};root.querySelector('#v3unknown').onclick=()=>{st.showUnknown=!st.showUnknown;st.selected=null;render()};root.querySelectorAll('.v3node').forEach(n=>n.onclick=()=>{st.moved=false;st.selected=n.dataset.key;const e=st.events.find(x=>x.event_key===st.selected);root.querySelectorAll('.v3node').forEach(x=>x.classList.toggle('selected',x===n));const d=root.querySelector('#v3detail');d.innerHTML='<h3>'+esc(e.subject)+'</h3><div class="v3meta">PR #'+esc(e.pr_number)+' · '+esc(e.observed_at)+'<br>来源：'+esc((e.origin||'unknown').toUpperCase())+'<br>Agent ID：'+esc(e.agent_id||'未记录')+'<br>GPT ID：'+esc(e.gpt_id||'未记录')+'<br>唯一标识：'+esc(e.event_key||e.sha)+'</div><div id="v3task"></div>';task(e)});const c=root.querySelector('#v3canvas');c.onpointerdown=e=>{if(e.target.closest('.v3node'))return;e.preventDefault();if(window.getSelection)window.getSelection().removeAllRanges();st.drag=true;st.moved=false;st.sx=e.clientX;st.sy=e.clientY;st.ox=st.x;st.oy=st.y;c.classList.add('dragging');c.setPointerCapture(e.pointerId)};c.onpointermove=e=>{if(st.drag){const dx=e.clientX-st.sx,dy=e.clientY-st.sy;if(Math.abs(dx)+Math.abs(dy)>4)st.moved=true;st.x=st.ox+dx;st.y=st.oy+dy;apply()}};c.onpointerup=c.onpointercancel=()=>{st.drag=false;c.classList.remove('dragging')};c.onwheel=e=>{e.preventDefault();st.scale=Math.max(.4,Math.min(2.5,st.scale*(e.deltaY<0?1.1:.9)));apply()};apply()};window.__v3Render=render;window.__v3Build=build;window.__v3State=st;fetch('/api/status').then(r=>r.json()).then(d=>{st.events=build(d);render()}).catch(()=>{root.innerHTML='<p>无法读取 Dashboard 数据</p>'});setInterval(()=>{if(!root.querySelector('.v3canvas')&&window.__v3Render)window.__v3Render()},1200)})();
+(()=>{return;window.__v3Active=true;const root=document.querySelector('#pr-timeline');if(!root)return;const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));const st={events:[],filter:'all',selected:null,scale:1,x:0,y:0,drag:false,moved:false,sx:0,sy:0,ox:0,oy:0};const status=e=>{if(['needs human','error','failed'].includes(e.status))return ['err','出现错误'];if(e.status==='awaiting approval')return ['warn','等待审批'];if(e.status==='dispatched')return ['ok','自动审批成功'];return ['ok','已记录']};const build=d=>{const a=[...(d.events||[])];(d.github_prs?.prs||[]).forEach(p=>(p.commits||[]).forEach(c=>a.push({...c,pr_number:p.number,ref:p.head?.ref||'',cloud:true,status:p.state==='open'?'awaiting approval':'dispatched',origin:c.origin||'unknown',agent_id:c.agent_id||c.agent||'',gpt_id:c.gpt_id||c.chatgpt_id||''})));return a.sort((a,b)=>String(a.observed_at).localeCompare(String(b.observed_at)))};const apply=()=>{const s=root.querySelector('#v3stage');if(s)s.style.transform='translate3d('+st.x+'px,'+st.y+'px,0) scale('+st.scale+')';const z=root.querySelector('#v3zoom');if(z)z.textContent=Math.round(st.scale*100)+'%'};const task=async e=>{const b=root.querySelector('#v3task');if(!b)return;b.innerHTML='<div class="v3section"><b>任务.md</b><p>读取历史快照中…</p></div>';try{const x=await fetch('/api/task/at-commit?pr='+encodeURIComponent(e.pr_number??'unassigned')+'&sha='+encodeURIComponent(e.sha)).then(r=>r.json());if(!x.ok){b.innerHTML='<div class="v3section"><b>任务.md</b><p>'+esc(x.error||'该 commit 无任务.md 快照')+'</p></div>';return;}const items=(x.sections||[]).flatMap(s=>s.items||[]),done=items.filter(i=>i.state==='done').length,p=items.length?Math.round(done/items.length*100):0;b.innerHTML='<div class="v3section"><b>任务.md · '+esc(x.commit_sha?'历史快照':'当前状态')+'</b><div class="v3meta">'+esc(x.committed_at||x.path||'')+' · '+esc(x.summary||'')+'</div><div class="v3task-progress"><i style="width:'+p+'%"></i></div><div class="v3meta">'+p+'% 已完成</div>'+items.map(i=>'<div class="v3task-item '+(i.state==='done'?'done':'')+'"><span class="v3task-check">'+(i.state==='done'?'✓':'')+'</span><span>'+esc(i.label)+'</span></div>').join('')+'<details><summary>查看原始任务.md</summary><pre>'+esc(x.content||'')+'</pre></details></div>'}catch(err){b.innerHTML='<div class="v3section"><b>任务.md</b><p>读取失败：'+esc(err.message)+'</p></div>'}};const render=()=>{const nums=[...new Set(st.events.filter(e=>e.pr_number!=null).map(e=>e.pr_number))].sort((a,b)=>a-b),events=st.events.filter(e=>(st.filter==='all'||String(e.pr_number)===String(st.filter))&&(st.showUnknown||['agent','chatgpt'].includes(String(e.origin||'').toLowerCase()))),groups=new Map;events.forEach(e=>{const k=e.pr_number??'unassigned';if(!groups.has(k))groups.set(k,[]);groups.get(k).push(e)});root.innerHTML='<div class="v3bar"><h2>PR 事件画布</h2><div><select id="v3filter"><option value="all">全部轨道</option>'+nums.map(n=>'<option value="'+n+'">PR #'+n+'</option>').join('')+'</select> <button id="v3minus">−</button><span id="v3zoom">'+Math.round(st.scale*100)+'%</span><button id="v3plus">+</button><button id="v3fit">适配</button><button id="v3unknown" title="显示/隐藏未知来源节点">'+(st.showUnknown?'◉':'◌')+' 未知</button></div></div><div class="v3layout"><div class="v3canvas" id="v3canvas"><div class="v3stage" id="v3stage">'+([...groups.entries()].map(([k,es])=>'<div class="v3track">'+es.map((e,i)=>{const [tone,label]=status(e),origin=(e.origin||'unknown').toLowerCase(),known=['agent','chatgpt'].includes(origin);return '<div class="v3node '+(known?'':'unknown ') +(st.selected===e.event_key?'selected':'')+'" data-key="'+esc(e.event_key)+'"><h4>PR #'+esc(k)+'</h4><div class="v3subject">'+esc(e.subject)+'</div><div class="v3meta">来源：'+esc(origin.toUpperCase())+'<br>Agent ID：'+esc(e.agent_id||'未记录')+'<br>GPT ID：'+esc(e.gpt_id||'未记录')+'<br>事件：'+esc(e.event_key||e.sha||'unknown')+'</div><span class="v3badge '+tone+'">'+label+'</span></div>'+(i<es.length-1?'<span class="v3arrow">→</span>':'')}).join('')+'</div>').join('')||'<p>当前筛选条件下没有事件</p>')+'</div></div><aside class="v3detail" id="v3detail">'+(st.selected?'<p>加载详情中…</p>':'<p>选择一个节点查看任务.md</p>')+'</aside></div>';const f=root.querySelector('#v3filter');f.value=st.filter;f.onchange=()=>{st.filter=f.value;st.selected=null;render()};root.querySelector('#v3minus').onclick=()=>{st.scale=Math.max(.4,st.scale*.85);apply()};root.querySelector('#v3plus').onclick=()=>{st.scale=Math.min(2.5,st.scale*1.18);apply()};root.querySelector('#v3fit').onclick=()=>{st.scale=1;st.x=20;st.y=20;apply()};root.querySelector('#v3unknown').onclick=()=>{st.showUnknown=!st.showUnknown;st.selected=null;render()};root.querySelector('#v3unknown').onclick=()=>{st.showUnknown=!st.showUnknown;st.selected=null;render()};root.querySelectorAll('.v3node').forEach(n=>n.onclick=()=>{st.moved=false;st.selected=n.dataset.key;const e=st.events.find(x=>x.event_key===st.selected);root.querySelectorAll('.v3node').forEach(x=>x.classList.toggle('selected',x===n));const d=root.querySelector('#v3detail');d.innerHTML='<h3>'+esc(e.subject)+'</h3><div class="v3meta">PR #'+esc(e.pr_number)+' · '+esc(e.observed_at)+'<br>来源：'+esc((e.origin||'unknown').toUpperCase())+'<br>Agent ID：'+esc(e.agent_id||'未记录')+'<br>GPT ID：'+esc(e.gpt_id||'未记录')+'<br>唯一标识：'+esc(e.event_key||e.sha)+'</div><div id="v3task"></div>';task(e)});const c=root.querySelector('#v3canvas');c.onpointerdown=e=>{if(e.target.closest('.v3node'))return;e.preventDefault();if(window.getSelection)window.getSelection().removeAllRanges();st.drag=true;st.moved=false;st.sx=e.clientX;st.sy=e.clientY;st.ox=st.x;st.oy=st.y;c.classList.add('dragging');c.setPointerCapture(e.pointerId)};c.onpointermove=e=>{if(st.drag){const dx=e.clientX-st.sx,dy=e.clientY-st.sy;if(Math.abs(dx)+Math.abs(dy)>4)st.moved=true;st.x=st.ox+dx;st.y=st.oy+dy;apply()}};c.onpointerup=c.onpointercancel=()=>{st.drag=false;c.classList.remove('dragging')};c.onwheel=e=>{e.preventDefault();st.scale=Math.max(.4,Math.min(2.5,st.scale*(e.deltaY<0?1.1:.9)));apply()};apply()};window.__v3Render=render;window.__v3Build=build;window.__v3State=st;fetch('/api/status').then(r=>r.json()).then(d=>{st.events=build(d);render()}).catch(()=>{root.innerHTML='<p>无法读取 Dashboard 数据</p>'});setInterval(()=>{if(!root.querySelector('.v3canvas')&&window.__v3Render)window.__v3Render()},1200)})();
 </script>"""
 
 
@@ -1521,7 +1645,9 @@ def handler(service: Service):
             if self.path == "/api/poll": return self.reply(200, service.poll_once())
             if self.path == "/api/browser/check": return self.reply(200, service.check_browser())
             if self.path == "/api/browser/open-chatgpt":
-                try: return self.reply(200, {"ok": True, "message": service.browser.open_chatgpt()})
+                try:
+                    result = service.browser.open_chatgpt()
+                    return self.reply(200, {"ok": True, **(result if isinstance(result, dict) else {"message": result})})
                 except Exception as exc: return self.reply(502, {"ok": False, "error": str(exc)[:500]})
             if self.path.startswith("/api/bindings/"):
                 length = int(self.headers.get("Content-Length", "0"))
@@ -1567,6 +1693,11 @@ def handler(service: Service):
                 if not event or event["status"] not in {"awaiting approval", "needs human"}:
                     return self.reply(HTTPStatus.CONFLICT, {"error": "event cannot be approved or retried"})
                 service.dispatch_event(event_key); return self.reply(200, {"ok": True})
+            if self.path.startswith("/api/pr/") and self.path.endswith("/start"):
+                raw = self.path.removeprefix("/api/pr/").removesuffix("/start")
+                try: result = service.continue_pr(int(raw))
+                except (TypeError, ValueError): return self.reply(400, {"ok": False, "error": "invalid PR number"})
+                return self.reply(200 if result.get("ok") else 409, result)
             if self.path == "/api/settings":
                 length = int(self.headers.get("Content-Length", "0")); data = json.loads(self.rfile.read(length))
                 if data.get("key") not in {"enabled", "agent_to_chatgpt", "chatgpt_to_agent", "auto_submit", "approval_required"} or not isinstance(data.get("value"), bool):
