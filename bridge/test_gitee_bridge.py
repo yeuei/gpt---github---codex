@@ -46,6 +46,8 @@ class BridgeUnitTests(unittest.TestCase):
         self.assertEqual(["get_pull_detail"], [tool["name"] for tool in policy.filter_tools(payload)["result"]["tools"]])
         self.assertTrue(policy.allows_arguments({"owner": "yeuei", "repo": "gpt---github---codex"}))
         self.assertFalse(policy.allows_arguments({"owner": "someone-else", "repo": "other"}))
+        unrestricted = Policy(self.config(allowed_repositories=frozenset()))
+        self.assertTrue(unrestricted.allows_arguments({"owner": "someone-else", "repo": "other"}))
 
 
 if __name__ == "__main__":
