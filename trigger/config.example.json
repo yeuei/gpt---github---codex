@@ -14,5 +14,12 @@
   },
   "binding": {
     "require_active": false
+  },
+  "gitee": {
+    "enabled": false,
+    "remote": "gitee",
+    "repository": "OWNER/REPOSITORY",
+    "api_base": "https://gitee.com/api/v5",
+    "access_token_env": "GITEE_ACCESS_TOKEN"
   }
 }

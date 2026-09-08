@@ -17,6 +17,7 @@ import sqlite3
 import subprocess
 import threading
 import time
+import os
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from http import HTTPStatus
@@ -24,6 +25,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, unquote, urlparse
+from urllib.parse import urlencode
+from urllib.request import Request, urlopen
 
 ROOT = Path(__file__).resolve().parent
 DEFAULT_CONFIG = ROOT / "config.local.json"
@@ -59,6 +62,9 @@ def load_config(path: Path) -> dict[str, Any]:
     config.setdefault("watch_branches", "all")
     config.setdefault("poll_interval_seconds", 15)
     config.setdefault("binding", {"require_active": False})
+    gitee = config.setdefault("gitee", {"enabled": False, "remote": "gitee", "repository": "", "api_base": "https://gitee.com/api/v5", "access_token_env": "GITEE_ACCESS_TOKEN"})
+    if gitee.get("access_token_env") and not gitee.get("access_token"):
+        gitee["access_token"] = os.environ.get(str(gitee["access_token_env"]), "")
     return config
 
 
@@ -455,16 +461,17 @@ class GitSource:
         self.remote = config["remote"]
         self.watch_branches = config.get("watch_branches", "all")
 
-    def refs(self) -> list[str]:
+    def refs(self, remote: str | None = None) -> list[str]:
+        remote = remote or self.remote
         names = run(
-            ["git", "for-each-ref", "--format=%(refname:short)", "refs/heads", f"refs/remotes/{self.remote}"],
+            ["git", "for-each-ref", "--format=%(refname:short)", "refs/heads", f"refs/remotes/{remote}"],
             self.repo,
         ).splitlines()
         refs: list[str] = []
         for name in names:
-            if name in {self.remote, f"{self.remote}/HEAD"}:
+            if name in {remote, f"{remote}/HEAD"}:
                 continue
-            branch = name.removeprefix(f"{self.remote}/")
+            branch = name.removeprefix(f"{remote}/")
             if self.watch_branches != "all" and branch not in set(self.watch_branches):
                 continue
             refs.append(name)
@@ -689,6 +696,7 @@ def parse_task_markdown(content: str) -> dict[str, Any]:
 class Service:
     def __init__(self, config: dict[str, Any], store: Store):
         self.config, self.store = config, store; self.git, self.browser = GitSource(config), OpenBrowserUse(config)
+        self.active_source = "github"
         self.last_local_error = ""; self.last_refresh_error = ""; self.last_refresh_at: str | None = None
         self.cache_dir = self.git.repo / ".cache"
         self.branch_cache_path = self.cache_dir / "dashboard-branch-cache.json"
@@ -751,19 +759,20 @@ class Service:
                 "pr_state": state, "latest": latest, "task": task, "binding": binding,
                 "message": "已准备最新本地交接上下文；请先人工审阅，再在唯一 GPT 会话中继续。"}
 
-    def cache_branch_tasks(self) -> dict[str, Any]:
+    def cache_branch_tasks(self, remote: str | None = None, source: str = "github") -> dict[str, Any]:
         """Persist every visible branch's complete local history and task snapshots.
 
         This reads Git objects only.  Network synchronization remains an explicit
         user action in ``refresh_from_github``.
         """
         branches: list[dict[str, Any]] = []
-        pr_states = self.store.setting("github_pr_states") or {}
+        remote = remote or self.git.remote
+        pr_states = self.store.setting(f"{source}_pr_states") or {}
         # Prefer the remote-tracking ref when a local branch points at the same
         # named GitHub branch; otherwise the Dashboard would show duplicates.
-        refs = self.git.refs()
-        remote_refs = {ref.removeprefix(f"{self.git.remote}/") for ref in refs if ref.startswith(f"{self.git.remote}/")}
-        refs = [ref for ref in refs if ref.startswith(f"{self.git.remote}/") or ref not in remote_refs]
+        refs = self.git.refs(remote)
+        remote_refs = {ref.removeprefix(f"{remote}/") for ref in refs if ref.startswith(f"{remote}/")}
+        refs = [ref for ref in refs if ref.startswith(f"{remote}/") or ref not in remote_refs]
         for ref in refs:
             try:
                 head = run(["git", "rev-parse", ref], self.git.repo)
@@ -824,7 +833,7 @@ class Service:
             # with an explicit ``prN`` branch name as a fallback.
             introduced_prs = [task["pr_number"] for commit in commits for task in commit["tasks"]]
             name_match = re.search(r"(?:^|[-_/])pr[-_]?([1-9][0-9]*)(?:$|[-_/])", ref, re.IGNORECASE)
-            short_ref = ref.removeprefix(f"{self.git.remote}/")
+            short_ref = ref.removeprefix(f"{remote}/")
             if name_match:
                 primary_pr = int(name_match.group(1))
             elif short_ref in {"main", "master"}:
@@ -837,7 +846,7 @@ class Service:
             branches.append({"ref": ref, "head": head, "base_ref": base_ref, "primary_pr": primary_pr,
                              "pr_state": cached_state.get("state", "unknown"), "pr_state_source": cached_state.get("source", "not_synced"),
                              "tasks": tasks, "nodes": commits})
-        payload = {"cached_at": now(), "branches": branches}
+        payload = {"cached_at": now(), "source": source, "remote": remote, "branches": branches}
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         temporary = self.branch_cache_path.with_suffix(".tmp")
         temporary.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
@@ -979,17 +988,28 @@ class Service:
         for event in self.store.fill_only_events(): self.dispatch_event(event["event_key"], allow_fill_only_resubmit=True); keys.append(event["event_key"])
         return keys
 
-    def scan_local(self) -> dict[str, Any]:
+    def source_remote(self, source: str) -> str:
+        if source == "github": return self.git.remote
+        if source == "gitee":
+            remote = str(self.config.get("gitee", {}).get("remote", ""))
+            if not self.config.get("gitee", {}).get("enabled") or not remote:
+                raise RuntimeError("Gitee 尚未在本机配置；请设置 gitee.enabled、remote 和 repository")
+            return remote
+        raise RuntimeError("未知仓库来源")
+
+    def scan_local(self, source: str | None = None) -> dict[str, Any]:
+        source = source or self.active_source
         try:
+            remote = self.source_remote(source)
             observed = []
-            for ref in self.git.refs():
+            for ref in self.git.refs(remote):
                 head, commits = self.git.poll(ref, self.store.cursor(ref))
                 for commit in commits: self.handle(commit, ref)
                 self.store.set_cursor(ref, head); observed.append({"ref": ref, "commits": len(commits), "head": head})
-            self.cache_branch_tasks()
-            self.last_local_error = ""; return {"ok": True, "source": "local_git", "refs": observed, "commits": sum(item["commits"] for item in observed)}
+            self.cache_branch_tasks(remote, source)
+            self.last_local_error = ""; return {"ok": True, "source": source, "refs": observed, "commits": sum(item["commits"] for item in observed)}
         except Exception as exc:
-            self.last_local_error = str(exc); return {"ok": False, "source": "local_git", "error": self.last_local_error}
+            self.last_local_error = str(exc); return {"ok": False, "source": source, "error": self.last_local_error}
 
     def _refresh_pr_states(self) -> str:
         if not shutil.which("gh"): return "gh CLI 不可用；GitHub PR 状态保持未同步/旧缓存，不做推断"
@@ -1005,13 +1025,25 @@ class Service:
         try: run(["git", "fetch", self.git.remote, "--prune", "--quiet"], self.git.repo, timeout=60)
         except Exception as exc:
             self.last_refresh_error = str(exc); self.last_refresh_at = now(); return {"ok": False, "source": "github_refresh", "error": self.last_refresh_error, "local_state_preserved": True}
-        pr_warning = self._refresh_pr_states(); self.last_refresh_error = ""; self.last_refresh_at = now(); scanned = self.scan_local(); cache = self.cache_branch_tasks(); return {"ok": scanned.get("ok", False), "source": "github_refresh", "fetched": True, "pr_state_warning": pr_warning, "scan": scanned, "cached_branches": len(cache["branches"]), "refreshed_at": self.last_refresh_at}
+        self.active_source = "github"; pr_warning = self._refresh_pr_states(); self.last_refresh_error = ""; self.last_refresh_at = now(); scanned = self.scan_local("github"); cache = self.cache_branch_tasks(self.git.remote, "github"); return {"ok": scanned.get("ok", False), "source": "github_refresh", "fetched": True, "pr_state_warning": pr_warning, "scan": scanned, "cached_branches": len(cache["branches"]), "refreshed_at": self.last_refresh_at}
+
+    def refresh_from_gitee(self) -> dict[str, Any]:
+        try: remote = self.source_remote("gitee"); run(["git", "fetch", remote, "--prune", "--quiet"], self.git.repo, timeout=60)
+        except Exception as exc:
+            self.last_refresh_error = str(exc); self.last_refresh_at = now(); return {"ok": False, "source": "gitee_refresh", "error": self.last_refresh_error, "local_state_preserved": True}
+        self.active_source = "gitee"; self.last_refresh_error = ""; self.last_refresh_at = now(); scanned = self.scan_local("gitee"); cache = self.cache_branch_tasks(remote, "gitee"); return {"ok": scanned.get("ok", False), "source": "gitee_refresh", "fetched": True, "scan": scanned, "cached_branches": len(cache["branches"]), "refreshed_at": self.last_refresh_at}
+
+    def select_source(self, source: str) -> dict[str, Any]:
+        try:
+            self.source_remote(source); self.active_source = source
+            return self.scan_local(source)
+        except Exception as exc: return {"ok": False, "source": source, "error": str(exc)}
 
     def poll_once(self) -> dict[str, Any]: return self.scan_local()
 
     def status(self) -> dict[str, Any]:
         cache = self.branch_cache()
-        data = self.store.snapshot(); data.update({"repository": self.repository_status(), "browser": self.browser_status, "auto_mode": self.auto_mode(), "last_local_error": self.last_local_error, "last_refresh_error": self.last_refresh_error, "app_approvals": pending_approval_requests(), "branch_cache": {"cached_at": cache.get("cached_at"), "branch_count": len(cache.get("branches", []))}}); return data
+        data = self.store.snapshot(); data.update({"repository": self.repository_status(), "browser": self.browser_status, "active_source": self.active_source, "sources": {"github": {"configured": True}, "gitee": {"configured": bool(self.config.get("gitee", {}).get("enabled")), "repository": self.config.get("gitee", {}).get("repository", "")}}, "auto_mode": self.auto_mode(), "last_local_error": self.last_local_error, "last_refresh_error": self.last_refresh_error, "app_approvals": pending_approval_requests(), "branch_cache": {"cached_at": cache.get("cached_at"), "branch_count": len(cache.get("branches", [])), "source": cache.get("source")}}); return data
 
 
 def handler(service: Service):
@@ -1041,6 +1073,9 @@ def handler(service: Service):
         def do_POST(self) -> None:
             if self.path in {"/api/scan-local", "/api/poll"}: return self.reply(200, service.scan_local())
             if self.path == "/api/refresh-github": return self.reply(200, service.refresh_from_github())
+            if self.path == "/api/refresh-gitee": return self.reply(200, service.refresh_from_gitee())
+            if self.path == "/api/source":
+                data = self.read_json() or {}; result = service.select_source(str(data.get("source", ""))); return self.reply(200 if result.get("ok") else 409, result)
             if self.path == "/api/browser/check": return self.reply(200, service.check_browser())
             if self.path == "/api/browser/open-gpt":
                 result = service.open_gpt(); return self.reply(200 if result.get("ok") else 409, result)
